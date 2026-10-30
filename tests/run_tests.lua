@@ -252,7 +252,7 @@ test("config validation clamps and rejects", function()
     check(Config.set("sellThreshold", 5), "numeric accepted")
     eq(Config.get("sellThreshold"), 1, "clamped to max")
     check(not Config.set("interactMethod", "Bogus"), "invalid enum rejected")
-    eq(Config.get("interactMethod"), "Tool")
+    eq(Config.get("interactMethod"), "Auto")
     check(not Config.set("unknownKey", 1), "unknown key rejected")
 end)
 
@@ -619,6 +619,276 @@ test("streamed-out deposit is remembered and its site explored until it streams 
     eq(#mods.Ores.memory, 0, "memory entry consumed")
     mods.Auto.stop("test")
     noErrors(mods)
+end)
+
+---------------------------------------------------------------------------------- v3.1 methods
+-- Layout seen in public TWW scripts: Mining/OreDeposits/<group>/<Model>{MeshPart "CoalOre"}, no
+-- OreRemaining. The mock game removes the ore mesh when a node is exhausted and re-adds it later.
+local function layoutBWorld(nodes)
+    M.reset()
+    M.makeCharacter(V(0, 3, 0))
+    local interact = M.new("Folder", M.workspace)
+    interact.Name = "WORKSPACE_Interactables"
+    local mining = M.new("Folder", interact)
+    mining.Name = "Mining"
+    local deposits = M.new("Folder", mining)
+    deposits.Name = "OreDeposits"
+    local group = M.new("Folder", deposits)
+    group.Name = "WhisperingCave"
+    M.mining, M.nodes = mining, {}
+    for i, spec in ipairs(nodes) do
+        local model = M.new("Model")
+        model.Name = "Node" .. i
+        local base = M.new("Part", model)
+        base.Name = "Base"
+        base.Size = V(5, 1, 5)
+        base.Position = spec[2] - V(0, 2, 0)
+        if spec[3] ~= false then
+            local mesh = M.new("MeshPart", model)
+            mesh.Name = spec[1]
+            mesh.Size = V(4, 4, 4)
+            mesh.Position = spec[2]
+        end
+        model.Parent = group
+        M.nodes[model] = {left = spec[4] or 3, meshName = spec[1], pos = spec[2]}
+    end
+    return mining
+end
+
+-- Pickaxe hit logic shared by the Tool and the custom-item mocks (layout B: inventory only).
+local function hitNearestMesh(root)
+    local best, bestD
+    for model, state in pairs(M.nodes) do
+        local mesh = model:FindFirstChild(state.meshName)
+        if mesh then
+            local d = (mesh.Position - root.Position).Magnitude
+            if d < 9 and (not bestD or d < bestD) then best, bestD = model, d end
+        end
+    end
+    if not best then return end
+    local state = M.nodes[best]
+    state.hits = (state.hits or 0) + 1
+    if state.hits % 2 == 0 then
+        if M.inventory then
+            M.inventory.count = M.inventory.count + 1
+            M.inventory.label.Text = M.inventory.count .. "/" .. M.inventory.cap
+        end
+        state.left = state.left - 1
+        if state.left <= 0 then
+            best:FindFirstChild(state.meshName):Destroy()
+            if M.respawnAfter then
+                task.delay(M.respawnAfter, function()
+                    local mesh = M.new("MeshPart")
+                    mesh.Name = state.meshName
+                    mesh.Size = V(4, 4, 4)
+                    mesh.Position = state.pos
+                    mesh.Parent = best
+                    state.left, state.hits = 3, 0
+                end)
+            end
+        end
+    end
+end
+
+test("public-script layout: OreDeposits groups, ore MeshParts, no OreRemaining", function()
+    layoutBWorld({{"CoalOre", V(20, 2, 0)}, {"IronOre", V(-60, 2, 0)}, {"CoalOre", V(25, 2, 25), false}})
+    local tool = givePickaxe("noop")
+    tool.Activated:Connect(function() local root = M.root() if root then hitNearestMesh(root) end end)
+    giveInventoryGui(0, 40)
+    M.respawnAfter = 8
+    local _, mods = inject()
+    local Ores = mods.Ores
+    check(Ores.kinds.Coal and Ores.kinds.Iron, "types read from ore mesh names")
+    check(not Ores.kinds.OreDeposits and not Ores.kinds["Whispering Cave"], "no bogus types from folder names")
+    check(Ores.meshLayout, "mesh layout detected")
+    local exhausted
+    for node, e in pairs(Ores.deposits) do
+        if not e.mesh then exhausted = e end
+        if e.mesh then eq(e.kindSource, "ore mesh name", "kind source") end
+    end
+    check(exhausted and not Ores.isAvailable(exhausted), "node without ore mesh is unavailable")
+    mods.Config.set("selected", {Coal = true, Iron = false})
+    mods.Auto.start()
+    local mined = M.runUntil(function() return mods.Stats.depleted >= 1 end, 90)
+    check(mined, "coal node mined until its mesh disappeared (state " .. mods.Auto.state .. ")")
+    eq(mods.Stats.yields, 3, "three verified units through the inventory counter")
+    local respawned = M.runUntil(function()
+        for _, e in pairs(Ores.deposits) do
+            if e.kind == "Coal" and e.mesh and e.node.Name == "Node1" then return true end
+        end
+        return false
+    end, 30)
+    check(respawned, "respawned ore mesh noticed")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("pickaxe as a game item: hotbar key found by trial, mining by simulated clicks", function()
+    world({deposits = {{"Coal", V(20, 2, 0)}}})
+    local hits = 0
+    M.onKey = function(key, down)
+        if not down then return end
+        local existing = M.character:FindFirstChild("Pickaxe")
+        if existing then existing:Destroy() end
+        if key == Enum.KeyCode.Three then
+            local held = M.new("Model")
+            held.Name = "Pickaxe"
+            M.new("Part", held).Name = "Handle"
+            held.Parent = M.character
+        end
+    end
+    M.onClick = function()
+        if not M.character:FindFirstChild("Pickaxe") then return end
+        local root = M.root()
+        for _, d in ipairs(M.mining:GetDescendants()) do
+            if d.Name == "OreRemaining" and (d.Parent.Parent.PrimaryPart.Position - root.Position).Magnitude < 9 then
+                hits = hits + 1
+                if hits % 2 == 0 and d.Value > 0 then d.Value = d.Value - 1 end
+                return
+            end
+        end
+    end
+    local _, mods = inject()
+    mods.Auto.start()
+    local mined = M.runUntil(function() return mods.Stats.depleted >= 1 end, 90)
+    check(mined, "deposit mined with a non-Tool pickaxe (state " .. mods.Auto.state .. ", " .. mods.Tools.status .. ")")
+    eq(mods.Learned.get("hotbarSlot"), 3, "hotbar slot learned")
+    eq(mods.Learned.get("interact"), "Click", "click interaction learned")
+    eq(mods.Stats.yields, 3, "verified units")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("inventory counter and money display are learned by observation; sale verified with them", function()
+    world({deposits = {{"Coal", V(20, 2, 0), 3}}})
+    givePickaxe()
+    -- No inventory/money words anywhere in the names: only observation can identify these labels.
+    local hud = M.new("ScreenGui", M.playerGui)
+    hud.Name = "HUD"
+    local panel = M.new("Frame", hud)
+    panel.Name = "Panel"
+    local countLabel = M.new("TextLabel", panel)
+    countLabel.Name = "A"
+    countLabel.Text = "0/40"
+    local cashLabel = M.new("TextLabel", panel)
+    cashLabel.Name = "B"
+    cashLabel.Text = "$100"
+    local clock = M.new("TextLabel", panel)
+    clock.Name = "C"
+    clock.Text = "7"
+    M.inventory = {count = 0, cap = 40, label = countLabel}
+    task.spawn(function() while true do task.wait(0.5) clock.Text = tostring(math.random(1, 99)) end end)
+    giveSeller(V(-30, 3, 0), false)
+    M.onPromptTriggered = function()
+        cashLabel.Text = "$" .. (100 + M.inventory.count * 20)
+        M.inventory.count = 0
+        countLabel.Text = "0/40"
+    end
+    local _, mods = inject()
+    mods.Config.set("sellAfterDeposits", 1)
+    mods.Auto.start()
+    local sold = M.runUntil(function() return mods.Stats.sales >= 1 end, 120)
+    check(sold, "sale verified (last " .. tostring(mods.Sellers.lastResult) .. ": " .. tostring(mods.Sellers.lastDetail) .. ")")
+    eq(mods.Learned.get("inventoryPath"), "HUD/Panel/A", "inventory counter learned")
+    eq(mods.Learned.get("moneyPath"), "HUD/Panel/B", "money display learned")
+    check(tostring(mods.Sellers.lastDetail):find("money", 1, true), "sale confirmed by a money increase")
+    check(mods.Wallet.label:find("Learned", 1, true), "wallet uses the learned display")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("sell prompt that ignores the prompt API is triggered by holding its own key (F)", function()
+    world({deposits = {{"Coal", V(25, 2, 0), 10}}})
+    givePickaxe()
+    giveInventoryGui(9, 10)
+    giveMoney(100)
+    local prompt = giveSeller(V(-30, 3, 0))
+    prompt.KeyboardKeyCode = Enum.KeyCode.F
+    prompt.ActionText = "Sell Loot"
+    M.promptIgnoresInputHold = true
+    local downAt
+    M.onKey = function(key, down)
+        if key ~= Enum.KeyCode.F then return end
+        if down then downAt = M.S.now elseif downAt then M.tryTriggerPrompt(prompt, M.S.now - downAt) end
+    end
+    local _, mods = inject()
+    mods.Config.set("sellThreshold", 0.9)
+    mods.Auto.start()
+    local sold = M.runUntil(function() return mods.Stats.sales >= 1 end, 120)
+    check(sold, "sale verified (" .. tostring(mods.Sellers.lastDetail) .. ")")
+    check(tostring(mods.Sellers.lastDetail):find("holding key F", 1, true), "key fallback used")
+    local good = mods.Learned.get("goodSellers")
+    check(type(good) == "table" and #good == 1, "paying seller remembered for this place")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("an ore type that never reacts is skipped with the wiki tier hint; others continue", function()
+    world({deposits = {{"Gold", V(12, 2, 0)}, {"Gold", V(12, 2, 14)}, {"Gold", V(12, 2, -14)}, {"Coal", V(-45, 2, 0)}}})
+    local tool = givePickaxe("noop")
+    local hits = 0
+    tool.Activated:Connect(function()
+        local root = M.root()
+        for _, d in ipairs(M.mining.Coal:GetDescendants()) do
+            if d.Name == "OreRemaining" and (d.Parent.Parent.PrimaryPart.Position - root.Position).Magnitude < 9 then
+                hits = hits + 1
+                if hits % 2 == 0 and d.Value > 0 then d.Value = d.Value - 1 end
+            end
+        end
+    end)
+    local _, mods = inject()
+    mods.Config.set("stallTimeout", 5)
+    mods.Auto.start()
+    local ok = M.runUntil(function() return mods.Stats.depleted >= 1 end, 240)
+    check(mods.Ores.suspendedKinds.Gold, "gold suspended after three non-reacting deposits")
+    check(ok, "coal still mined")
+    local warned = false
+    for _, e in ipairs(mods.Log.entries) do if e.msg:find("pickaxe tier 5", 1, true) then warned = true end end
+    check(warned, "tier hint logged")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("movement driver switches to Humanoid:Move when MoveTo does not move the character", function()
+    world({deposits = {{"Coal", V(30, 2, 0)}}})
+    givePickaxe()
+    M.humanoid._ignoreMoveTo = true
+    local _, mods = inject()
+    mods.Auto.start()
+    local mined = M.runUntil(function() return mods.Stats.depleted >= 1 end, 150)
+    eq(mods.Nav.driver, "Move", "driver switched")
+    check(mined, "deposit reached and mined with the fallback driver")
+    eq(mods.Learned.get("moveDriver"), "Move", "working driver remembered")
+    mods.Auto.stop("test")
+    noErrors(mods)
+end)
+
+test("verify assumptions reports each claim with evidence for both layouts", function()
+    world({deposits = {{"Coal", V(30, 2, 0)}}})
+    givePickaxe()
+    local _, mods = inject()
+    local R = mods.Verify.run()
+    local by = {}
+    for _, r in ipairs(R) do by[r.claim] = r end
+    eq(by["Deposits live under workspace.WORKSPACE_Interactables.Mining"].status, "CONFIRMED")
+    eq(by["Layout Mining/<OreType>/<Deposit> (v2.0 assumption)"].status, "CONFIRMED")
+    eq(by["Deposits expose DepositInfo.OreRemaining"].status, "CONFIRMED")
+    eq(by["Pickaxe is a Roblox Tool (v2.0 assumption)"].status, "CONFIRMED")
+    eq(by["Full inventory drops mined ore on the ground (wiki)"].status, "PENDING")
+    local report = mods.Verify.saveReport()
+    check(report:find("== Mining root ==", 1, true) and report:find("OreRemaining", 1, true), "report has the tree")
+    noErrors(mods)
+
+    layoutBWorld({{"CoalOre", V(20, 2, 0)}})
+    local _, modsB = inject()
+    local RB = modsB.Verify.run()
+    by = {}
+    for _, r in ipairs(RB) do by[r.claim] = r end
+    eq(by["Layout Mining/<OreType>/<Deposit> (v2.0 assumption)"].status, "CONTRADICTED")
+    eq(by["Layout Mining/OreDeposits/<group>/<Deposit> (public scripts)"].status, "CONFIRMED")
+    eq(by["Deposits expose DepositInfo.OreRemaining"].status, "CONTRADICTED")
+    check(by["Deposits expose DepositInfo.OreRemaining"].evidence:find("ore mesh", 1, true), "fallback named")
+    noErrors(modsB)
 end)
 
 ---------------------------------------------------------------------------------- runner

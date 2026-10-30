@@ -1,5 +1,5 @@
 --[[
-    TWW PROSPECTOR ULTIMATE  v3.0.0
+    TWW PROSPECTOR ULTIMATE  v3.1.0
     Autonomous mining assistant for Roblox "The Wild West" (TWW).
     Single self-contained file for client executors (target: Xeno 1.2.1).
 
@@ -9,20 +9,29 @@
         input for selling. No guessed RemoteEvents, no anti-cheat bypass, no concealment.
       * Nothing is "successful" unless an observable game signal confirms it
         (OreRemaining decreasing, inventory/money changing, deposit removal after progress).
-      * Unknown game data is reported as unknown, never invented.
+      * Unknown game data is reported as unknown, never invented. Where sources disagree or nothing is
+        documented, the script finds out at runtime (see Learn, Tools, Ores, Verify) instead of assuming.
       * Re-executing the script cleanly tears down every previous build first.
+
+    What public sources say about TWW (details and links in README.md):
+      * workspace.WORKSPACE_Interactables.Mining exists; older public scripts read deposits from
+        Mining.OreDeposits.<group>.<Model> with an ore MeshPart named "CoalOre"/"IronOre"/...
+      * Community wiki: a full inventory drops mined ore on the ground; nodes can drop gems instead;
+        stores sell loot with a held [F] "Sell Loot" prompt; the backpack has 40 slots (v4.4.0).
+      * The game uses its own item framework, so the pickaxe is probably not a Roblox Tool.
 
     Syntax note: the file deliberately sticks to the Lua 5.1 subset of Luau (no `continue`,
     no compound assignment, no type annotations) so the same file can be exercised by the
     offline mock test-suite with a stock Lua 5.1 interpreter.
 
     Module map (search for "==== MODULE:")
-      Bootstrap/Util  Session  Token  Log  Config  Stats  Char  Tools  Blacklist  Ores
-      Nav  Visual  Probe  Miner  Inventory  Wallet  Sellers  Targeting  Auto  UI  SelfTest  Main
+      Bootstrap/Util  Log  Session  Token  Config  Learned  Stats  Char  Input  Tools  Blacklist
+      Ores  Visual  Nav  Probe  Miner  Learn  Inventory  Wallet  Sellers  Targeting  Auto  UI
+      Verify  SelfTest  Main
 ]]
 
 -- ==== MODULE: Bootstrap ==================================================================
-local VERSION = "3.0.0"
+local VERSION = "3.1.0"
 local APP_NAME = "TWW Prospector Ultimate"
 local GUI_NAME = "TWW_Prospector_Ultimate"
 local VISUAL_NAME = "TWW_Prospector_Visuals"
@@ -77,7 +86,7 @@ end
 Exec.vim = getService("VirtualInputManager")
 
 -- Forward declarations: these modules reference each other and are assigned further down.
-local Probe, Miner, Inventory, Wallet, Sellers, Targeting, Auto, UI, SelfTest
+local Probe, Miner, Inventory, Wallet, Sellers, Targeting, Auto, UI, SelfTest, Learn, Verify
 
 -- ==== MODULE: Util =======================================================================
 local U = {}
@@ -489,7 +498,9 @@ local CONFIG_SCHEMA = {
     skipDepleted = {"boolean", true},
     allowUnknownRemaining = {"boolean", true},
     avoidContested = {"boolean", true},
-    interactMethod = {"enum", "Tool", nil, nil, {"Tool", "Click", "Both"}},
+    interactMethod = {"enum", "Auto", nil, nil, {"Auto", "Tool", "Click", "Both"}},
+    pickaxeSlot = {"number", 0, 0, 9},
+    learned = {"table", {}},
     swingInterval = {"number", 0.85, 0.25, 5},
     stallTimeout = {"number", 15, 5, 90},
     mineTimeout = {"number", 150, 20, 900},
@@ -641,6 +652,43 @@ function Config.save(force)
         end)
         if not ok then Log.debug("Config", "Settings file not written: " .. tostring(err), "cfgwrite", 60) end
     end
+end
+
+-- ==== MODULE: Learned ====================================================================
+-- Knowledge the script discovers about the current place at runtime (hotbar slot, working
+-- interaction method, inventory counter, money source, movement driver, sellers that did / did not
+-- pay). Stored per PlaceId inside the persisted settings, so it survives reinjection and restarts.
+local Learned = {}
+
+function Learned.place()
+    local key = "place"
+    pcall(function() key = tostring(game.PlaceId) end)
+    local all = Config.values.learned
+    if type(all) ~= "table" then
+        all = {}
+        Config.values.learned = all
+    end
+    if type(all[key]) ~= "table" then all[key] = {} end
+    return all[key]
+end
+
+function Learned.get(key)
+    return Learned.place()[key]
+end
+
+function Learned.set(key, value)
+    local place = Learned.place()
+    if place[key] ~= value then
+        place[key] = value
+        Config.dirty = true
+    end
+end
+
+function Learned.clear()
+    local key = "place"
+    pcall(function() key = tostring(game.PlaceId) end)
+    if type(Config.values.learned) == "table" then Config.values.learned[key] = {} end
+    Config.dirty = true
 end
 
 -- ==== MODULE: Stats ======================================================================
@@ -819,9 +867,81 @@ function Char.waitAlive(token, timeout)
     return Char.get() ~= nil
 end
 
+-- ==== MODULE: Input ======================================================================
+-- Simulated player input through VirtualInputManager (feature-detected). Used only for things a
+-- player does by hand: hotbar number keys, clicking on a deposit, holding a prompt's key.
+local Input = {}
+
+function Input.available()
+    return Exec.vim ~= nil
+end
+
+function Input.key(keyCode, hold, token)
+    if not Exec.vim or not keyCode then return false, "VirtualInputManager unavailable" end
+    local ok, err = pcall(function() Exec.vim:SendKeyEvent(true, keyCode, false, game) end)
+    if not ok then return false, err end
+    if token then token:sleep(hold or 0.06) else task.wait(hold or 0.06) end
+    pcall(function() Exec.vim:SendKeyEvent(false, keyCode, false, game) end)
+    return true
+end
+
+-- True when viewport point (x, y) lies on this script's own window (a click there would hit the GUI).
+local function overOwnWindow(x, y)
+    local w = UI and UI.window
+    if not w or not UI.root or not UI.root.Enabled or not w.Visible then return false end
+    local ok, inside = pcall(function()
+        local inset = Vector2.new(0, 0)
+        local gs = getService("GuiService")
+        if gs and not UI.root.IgnoreGuiInset then inset = gs:GetGuiInset() end
+        local p, s = w.AbsolutePosition + inset, w.AbsoluteSize
+        return x >= p.X and x <= p.X + s.X and y >= p.Y and y <= p.Y + s.Y
+    end)
+    return ok and inside
+end
+
+-- Left click at viewport coordinates; the own window is briefly hidden if it covers the point.
+function Input.click(x, y)
+    if not Exec.vim then return false, "VirtualInputManager unavailable" end
+    local hidden = overOwnWindow(x, y)
+    if hidden then pcall(function() UI.root.Enabled = false end) end
+    local ok, err = pcall(function()
+        pcall(function() Exec.vim:SendMouseMoveEvent(x, y, game) end)
+        Exec.vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.05)
+        Exec.vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    if hidden then pcall(function() UI.root.Enabled = true end) end
+    return ok, err
+end
+
+local DIGIT_KEYS = {"One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"}
+function Input.digitKey(n)
+    local name = DIGIT_KEYS[n]
+    if not name then return nil end
+    local ok, key = pcall(function() return Enum.KeyCode[name] end)
+    return ok and key or nil
+end
+
 -- ==== MODULE: Tools ======================================================================
--- Pickaxe identification by configurable name patterns (default "pickaxe,pick").
-local Tools = {status = "Not checked", lastName = nil}
+-- Public TWW scripts show a custom item framework (ReplicatedStorage...Character.Items, equipped via
+-- PlayerCharacter:EquipItem), so the pickaxe is probably NOT a Roblox Tool. Equip paths, in order:
+--   1. a Roblox Tool matching the name patterns            -> Humanoid:EquipTool
+--   2. a game item that is already in hand                 -> pickaxe-named model/part on the character
+--      (or on its copy under workspace.WORKSPACE_Entities.Players, also seen in public scripts)
+--   3. a hotbar number key (Settings slot, learned slot, slot found in the hotbar UI, else 1-9 tried
+--      once every 5 minutes) pressed through VirtualInputManager, confirmed by observing the item
+-- Handle: {kind = "tool", tool = Tool} | {kind = "custom", visual = Instance|nil, slot = n, assumed = bool}
+local Tools = {status = "Not checked", lastName = nil, lastTrial = -1000}
+
+function Tools.matches(name)
+    local lname = string.lower(tostring(name or ""))
+    local preferred = string.lower(U.trim(Config.get("preferredPickaxe") or ""))
+    if preferred ~= "" and lname == preferred then return true end
+    for _, pattern in ipairs(U.splitList(Config.get("pickaxePatterns"))) do
+        if U.has(lname, pattern) then return true end
+    end
+    return false
+end
 
 function Tools.score(tool)
     local name = string.lower(tool.Name)
@@ -829,18 +949,14 @@ function Tools.score(tool)
     if preferred ~= "" and name == preferred then return 10000 end
     local tip = ""
     pcall(function() tip = string.lower(tool.ToolTip or "") end)
-    local matched = false
-    for _, pattern in ipairs(U.splitList(Config.get("pickaxePatterns"))) do
-        if U.has(name, pattern) or (tip ~= "" and U.has(tip, pattern)) then matched = true break end
-    end
-    if not matched then return nil end
+    if not (Tools.matches(name) or (tip ~= "" and Tools.matches(tip))) then return nil end
     local score = 100
     local tier = tonumber(string.match(name, "tier%s*(%d+)") or string.match(name, "(%d+)"))
     if tier then score = score + math.min(tier, 50) * 10 end
     return score
 end
 
--- Returns the best pickaxe and where it is ("equipped" | "backpack").
+-- Best Roblox Tool pickaxe and where it is ("equipped" | "backpack").
 function Tools.find()
     local c = Char.get()
     if not c or not LocalPlayer then return nil, "no_character" end
@@ -864,21 +980,115 @@ function Tools.find()
     return best, where
 end
 
-function Tools.isEquipped(tool)
-    local c = Char.get()
-    return c ~= nil and tool ~= nil and U.alive(tool) and tool.Parent == c
+function Tools.characterModels()
+    local list = {}
+    if Char.character then list[1] = Char.character end
+    local entities = Workspace:FindFirstChild("WORKSPACE_Entities")
+    local players = entities and entities:FindFirstChild("Players")
+    local rep = LocalPlayer and players and players:FindFirstChild(LocalPlayer.Name)
+    if rep and rep ~= Char.character then list[#list + 1] = rep end
+    return list
 end
 
-function Tools.ensureEquipped(token)
-    local tool, where = Tools.find()
-    if not tool then
-        Tools.status = "No pickaxe in character or backpack"
-        return nil, "no_pickaxe"
+-- A pickaxe-named part/model/tool currently attached to the character (custom items included).
+function Tools.equippedVisual()
+    for _, model in ipairs(Tools.characterModels()) do
+        local ok, list = pcall(function() return model:GetDescendants() end)
+        if ok then
+            for i, d in ipairs(list) do
+                if i > 400 then break end
+                if (d:IsA("BasePart") or d:IsA("Model") or d:IsA("Tool") or d:IsA("Accessory")) and Tools.matches(d.Name) then
+                    return d
+                end
+            end
+        end
     end
+    return nil
+end
+
+local HOTBAR_WORDS = {"hotbar", "toolbar", "quickbar", "itembar", "slots", "weaponwheel", "backpack"}
+
+-- Hotbar slot number of a pickaxe-labelled element inside a hotbar-like frame, if the UI shows one.
+function Tools.hotbarSlotFromUI()
+    if not PlayerGui then return nil end
+    local ok, list = pcall(function() return PlayerGui:GetDescendants() end)
+    if not ok then return nil end
+    for i, inst in ipairs(list) do
+        if i > 6000 then break end
+        if inst:IsA("GuiObject") and not U.isDescendantOf(inst, UI and UI.root) then
+            local text = (inst:IsA("TextLabel") or inst:IsA("TextButton")) and (inst.Text or "") or ""
+            if Tools.matches(inst.Name) or (text ~= "" and Tools.matches(text)) then
+                local node, inBar = inst, false
+                for _ = 1, 6 do
+                    node = node.Parent
+                    if not node or node == PlayerGui then break end
+                    local lname = string.lower(node.Name)
+                    for _, w in ipairs(HOTBAR_WORDS) do if U.has(lname, w) then inBar = true end end
+                end
+                if inBar then
+                    local slot = inst
+                    for _ = 1, 4 do
+                        if not slot or slot == PlayerGui then break end
+                        local n = tonumber(string.match(slot.Name, "(%d+)%s*$"))
+                        if n and n >= 1 and n <= 9 then return n end
+                        for _, c in ipairs(slot:GetChildren()) do
+                            if c:IsA("TextLabel") then
+                                local d = tonumber(string.match(c.Text or "", "^%s*(%d)%s*$"))
+                                if d and d >= 1 then return d end
+                            end
+                        end
+                        slot = slot.Parent
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function pressSlot(slot, token)
+    local key = Input.digitKey(slot)
+    if not key then return false end
+    Input.key(key, 0.06, token)
+    local deadline = U.now() + 1.2
+    while U.now() < deadline do
+        if token and token:dead() then return false end
+        if Tools.equippedVisual() then return true end
+        task.wait(0.1)
+    end
+    return false
+end
+
+local function slotSucceeded(slot)
+    Learned.set("hotbarSlot", slot)
+    local visual = Tools.equippedVisual()
+    Tools.status = "Equipped via hotbar key " .. slot .. (visual and (": " .. visual.Name) or "")
+    Tools.lastName = visual and visual.Name or ("hotbar " .. slot)
+    Log.info("Tools", Tools.status, "hotbar:" .. slot, 30)
+    return {kind = "custom", visual = visual, slot = slot}
+end
+
+function Tools.isEquipped(handle)
+    if not handle then return false end
+    if handle.kind == "tool" then
+        local c = Char.get()
+        return c ~= nil and U.alive(handle.tool) and handle.tool.Parent == c
+    end
+    if handle.assumed then return true end
+    return Tools.equippedVisual() ~= nil
+end
+
+-- True when some pickaxe is obtainable (used by auto-resume checks).
+function Tools.available()
+    return (Tools.find()) ~= nil or Tools.equippedVisual() ~= nil
+        or (Input.available() and U.now() - Tools.lastTrial > 300)
+end
+
+local function equipRobloxTool(tool, where, token)
     Tools.lastName = tool.Name
     if where == "equipped" then
         Tools.status = "Equipped: " .. tool.Name
-        return tool
+        return {kind = "tool", tool = tool}
     end
     local c, h = Char.get()
     if not h then return nil, "no_character" end
@@ -891,12 +1101,54 @@ function Tools.ensureEquipped(token)
         if tool.Parent == c then
             Tools.status = "Equipped: " .. tool.Name
             Log.info("Tools", "Equipped " .. tool.Name, "equipped:" .. tool.Name, 20)
-            return tool
+            return {kind = "tool", tool = tool}
         end
         task.wait(0.1)
     end
     Tools.status = "Equip did not take effect"
     return nil, "equip_failed"
+end
+
+function Tools.ensureEquipped(token)
+    local tool, where = Tools.find()
+    if tool then return equipRobloxTool(tool, where, token) end
+    local visual = Tools.equippedVisual()
+    if visual then
+        Tools.status = "In hand (game item): " .. visual.Name
+        Tools.lastName = visual.Name
+        return {kind = "custom", visual = visual}
+    end
+    if not Input.available() then
+        Tools.status = "Pickaxe is not a Roblox Tool and no input API is available to press its hotbar key"
+        return nil, "manual_equip"
+    end
+    local configured = Config.get("pickaxeSlot")
+    local tried = {}
+    for _, slot in ipairs({configured > 0 and configured or nil, Learned.get("hotbarSlot"), Tools.hotbarSlotFromUI()}) do
+        if slot and not tried[slot] then
+            tried[slot] = true
+            if pressSlot(slot, token) then return slotSucceeded(slot) end
+            if token and token:dead() then return nil, "cancelled" end
+        end
+    end
+    if configured > 0 then
+        -- The user named the slot but the item cannot be seen on the character: trust the setting;
+        -- mining verification decides whether it actually works.
+        Tools.status = "Pressed hotbar key " .. configured .. " (pickaxe not visible on the character)"
+        Log.warn("Tools", Tools.status, "assumedslot", 60)
+        return {kind = "custom", slot = configured, assumed = true}
+    end
+    if U.now() - Tools.lastTrial > 300 then
+        Tools.lastTrial = U.now()
+        Tools.status = "Trying hotbar keys 1-9 to find the pickaxe"
+        Log.info("Tools", Tools.status)
+        for slot = 1, 9 do
+            if token and token:dead() then return nil, "cancelled" end
+            if not tried[slot] and pressSlot(slot, token) then return slotSucceeded(slot) end
+        end
+    end
+    Tools.status = "No pickaxe found (no Roblox Tool, none in hand, no hotbar key equipped one)"
+    return nil, "no_pickaxe"
 end
 
 -- ==== MODULE: Blacklist ==================================================================
@@ -952,12 +1204,19 @@ function Blacklist:activeCount()
 end
 
 -- ==== MODULE: Ores =======================================================================
--- Event-driven ore registry. The Mining root is resolved once (configurable paths, then a
--- bounded heuristic search), every container is watched with ChildAdded/ChildRemoved and every
--- deposit's OreRemaining value is watched with .Changed. Nothing rescans Workspace per frame.
+-- Event-driven ore registry. Two layouts are supported because two sources disagree:
+--   A) Mining/<OreType>/<Deposit model with DepositInfo.OreRemaining>          (your v2.0 script)
+--   B) Mining/OreDeposits/<group Folder>/<Deposit Model>{MeshPart "CoalOre"}    (public TWW scripts:
+--      LightMildTH/RobloxScripts TheWildWest.lua, yasinert12 ore ESP). In B an exhausted node loses
+--      its ore MeshPart, which is how depletion/respawn is tracked when OreRemaining does not exist.
+-- The ore type comes from deposit-level evidence first (type attribute, ore mesh name, deposit name)
+-- and only then from folder names. The root is resolved from configurable paths, then a folder named
+-- like "Mining", then the common ancestor of ore-named parts. Containers are watched with
+-- ChildAdded/ChildRemoved and values with .Changed; nothing rescans Workspace per frame.
 local Ores = {
     root = nil,
     rootLabel = "Not found",
+    rootHow = "-",
     status = "Not scanned",
     kinds = {},
     kindList = {},
@@ -968,8 +1227,12 @@ local Ores = {
     memory = {},
     containers = {},
     rootConns = {},
-    lastResolve = 0,
+    lastResolve = -1000,
+    lastOreScan = -1000,
     lastStats = 0,
+    meshLayout = false,
+    kindStrikes = {},
+    suspendedKinds = {},
     blacklist = Blacklist.new("deposits"),
     remainingListeners = {},
 }
@@ -978,19 +1241,56 @@ local KIND_NOISE = {
     deposits = true, deposit = true, nodes = true, node = true, ores = true, ore = true,
     rocks = true, rock = true, veins = true, vein = true, spawns = true, spawn = true, folder = true,
 }
+local GENERIC_NAMES = {
+    model = true, part = true, meshpart = true, mesh = true, union = true, group = true, cluster = true,
+    mining = true, interactables = true, workspace = true, ["workspace interactables"] = true,
+}
+-- Ore and gem words (community wiki "Ores and Gems"); used to read types out of instance names.
+local ORE_WORDS = {"coal", "copper", "zinc", "iron", "limestone", "silver", "gold", "quartz", "sulfur",
+    "sulphur", "nitre", "saltpeter", "nickel", "platinum", "diamond", "ruby", "emerald", "sapphire",
+    "amethyst", "topaz", "opal", "jade"}
+local GEM_WORDS = {"diamond", "ruby", "emerald", "sapphire", "amethyst", "topaz", "opal", "jade", "gem"}
+-- Minimum pickaxe tier per ore according to the community wiki (game version 3.7.5). Informational.
+Ores.TIERS = {Coal = 1, Copper = 1, Zinc = 2, Iron = 3, Limestone = 3, Silver = 4, Gold = 5}
 local ROOT_FALLBACKS = {"WORKSPACE_Interactables/Mining", "Interactables/Mining", "Mining", "Ores", "OreDeposits"}
-local MAX_CONTAINER_DEPTH = 3
+local KIND_ATTRS = {"OreType", "Ore", "OreName", "Resource", "Mineral", "Type", "Kind"}
+local MAX_CONTAINER_DEPTH = 4
 
--- "CopperOre" -> "Copper", "Iron_Deposits" -> "Iron", "Gold" -> "Gold"
-function Ores.kindName(raw)
-    local s = string.gsub(tostring(raw), "[_%-%.]", " ")
+function Ores.oreWordKind(name)
+    local lname = string.lower(tostring(name or ""))
+    for _, w in ipairs(ORE_WORDS) do
+        if U.has(lname, w) then return U.titleCase(w) end
+    end
+    return nil
+end
+
+function Ores.isGemOrOreName(name)
+    local lname = string.lower(tostring(name or ""))
+    if Ores.oreWordKind(lname) then return true end
+    for _, w in ipairs(GEM_WORDS) do if U.has(lname, w) then return true end end
+    return string.match(tostring(name or ""), "Ore%d*$") ~= nil or lname == "ore"
+end
+
+-- Normalised, non-generic type name or nil: "CopperOre" -> "Copper", "OreDeposits" -> nil, "Node12" -> nil.
+function Ores.specificKind(raw)
+    local ore = Ores.oreWordKind(raw)
+    if ore then return ore end
+    local s = string.gsub(tostring(raw or ""), "[_%-%.]", " ")
     s = string.gsub(s, "(%l)(%u)", "%1 %2")
     local words = {}
     for word in string.gmatch(s, "%S+") do
-        if not KIND_NOISE[string.lower(word)] then words[#words + 1] = U.titleCase(word) end
+        word = string.gsub(word, "%d+$", "")
+        local lw = string.lower(word)
+        if word ~= "" and not KIND_NOISE[lw] and not GENERIC_NAMES[lw] then words[#words + 1] = U.titleCase(word) end
     end
-    if #words == 0 then return tostring(raw) end
-    return table.concat(words, " ")
+    if #words == 0 then return nil end
+    local name = table.concat(words, " ")
+    if GENERIC_NAMES[string.lower(name)] then return nil end
+    return name
+end
+
+function Ores.kindName(raw)
+    return Ores.specificKind(raw) or tostring(raw)
 end
 
 function Ores.isSelected(kind)
@@ -999,6 +1299,54 @@ end
 
 function Ores.priority(kind)
     return U.clamp(tonumber(Config.values.priorities[kind]) or 3, 1, 5)
+end
+
+local function isOreMeshName(name)
+    return Ores.oreWordKind(name) ~= nil or string.match(tostring(name), "Ore%d*$") ~= nil
+        or string.lower(tostring(name)) == "ore"
+end
+
+-- The part that visibly holds the ore (layout B: MeshPart "CoalOre" directly inside the deposit).
+function Ores.findOreMesh(node)
+    if node:IsA("BasePart") then
+        if isOreMeshName(node.Name) then return node end
+        return nil
+    end
+    for _, c in ipairs(node:GetChildren()) do
+        if c:IsA("BasePart") and isOreMeshName(c.Name) then return c end
+    end
+    return nil
+end
+
+local function hasDepositInfo(inst)
+    return inst:FindFirstChild("DepositInfo") ~= nil or inst:GetAttribute("OreRemaining") ~= nil
+end
+
+-- Returns kind, source. Deposit-level evidence wins over folder names.
+function Ores.resolveKind(node, containerKind)
+    local info = node:FindFirstChild("DepositInfo")
+    for _, holder in ipairs({node, info}) do
+        if holder then
+            for _, attr in ipairs(KIND_ATTRS) do
+                local v = holder:GetAttribute(attr)
+                if type(v) == "string" and Ores.specificKind(v) then return Ores.specificKind(v), "attribute " .. attr end
+                if holder == info then
+                    local sv = info:FindFirstChild(attr)
+                    if sv and sv:IsA("StringValue") and Ores.specificKind(sv.Value) then
+                        return Ores.specificKind(sv.Value), "DepositInfo." .. attr
+                    end
+                end
+            end
+        end
+    end
+    local mesh = Ores.findOreMesh(node)
+    if mesh and Ores.specificKind(mesh.Name) then return Ores.specificKind(mesh.Name), "ore mesh name" end
+    local own = Ores.oreWordKind(node.Name)
+    if own then return own, "deposit name" end
+    if containerKind then return containerKind, "folder name" end
+    local ownAny = Ores.specificKind(node.Name)
+    if ownAny then return ownAny, "deposit name" end
+    return "Unknown", "no evidence yet"
 end
 
 local function findPath(pathString)
@@ -1035,6 +1383,29 @@ local function heuristicRoot()
     return nil
 end
 
+-- Last resort, at most once a minute: the ancestor holding the most ore-named parts ("CoalOre").
+local function oreNamedRoot()
+    if U.now() - Ores.lastOreScan < 60 then return nil end
+    Ores.lastOreScan = U.now()
+    local ok, list = pcall(function() return Workspace:GetDescendants() end)
+    if not ok then return nil end
+    local counts, best, bestN = {}, nil, 0
+    for i, inst in ipairs(list) do
+        if i > 250000 then break end
+        if i % 4000 == 0 then task.wait() end
+        if inst:IsA("BasePart") and string.match(inst.Name, "%aOre%d*$") and Ores.oreWordKind(inst.Name) then
+            local deposit = inst.Parent
+            local anc = deposit and deposit.Parent and deposit.Parent.Parent
+            if anc and anc ~= Workspace and not (Char.character and U.isDescendantOf(inst, Char.character)) then
+                counts[anc] = (counts[anc] or 0) + 1
+                if counts[anc] > bestN then best, bestN = anc, counts[anc] end
+            end
+        end
+    end
+    if best and bestN >= 3 then return best end
+    return nil
+end
+
 function Ores.resolveRoot()
     local paths = {}
     for p in string.gmatch(Config.get("orePaths") or "", "[^;,]+") do paths[#paths + 1] = U.trim(p) end
@@ -1044,37 +1415,15 @@ function Ores.resolveRoot()
         if node then return node, p, "path" end
     end
     local found = heuristicRoot()
-    if found then return found, U.fullName(found), "heuristic" end
-    return nil
-end
-
-local function hasDepositInfo(inst)
-    return inst:FindFirstChild("DepositInfo") ~= nil or inst:GetAttribute("OreRemaining") ~= nil
-end
-
--- Classifies a child of a container: "deposit", "container" or nil.
-local function classify(child, depth)
-    if child:IsA("BasePart") then return "deposit" end
-    if child:IsA("Folder") or child:IsA("Configuration") then
-        if child.Name == "DepositInfo" then return nil end
-        return depth < MAX_CONTAINER_DEPTH and "container" or nil
-    end
-    if child:IsA("Model") then
-        if hasDepositInfo(child) then return "deposit" end
-        -- A grouping model whose own children are deposits.
-        if depth < MAX_CONTAINER_DEPTH then
-            for _, sub in ipairs(child:GetChildren()) do
-                if sub:IsA("Model") and hasDepositInfo(sub) then return "container" end
-            end
-        end
-        return "deposit"
-    end
+    if found then return found, U.fullName(found), "folder name" end
+    found = oreNamedRoot()
+    if found then return found, U.fullName(found), "ore-named parts" end
     return nil
 end
 
 local function ensureKind(kind)
     if Ores.kinds[kind] then return Ores.kinds[kind] end
-    local record = {name = kind, total = 0, available = 0, nearest = nil, nearestDist = nil}
+    local record = {name = kind, total = 0, available = 0, depleted = 0, nearest = nil, nearestDist = nil}
     Ores.kinds[kind] = record
     Ores.kindList[#Ores.kindList + 1] = kind
     table.sort(Ores.kindList)
@@ -1100,13 +1449,16 @@ function Ores.readRemaining(entry)
     return nil
 end
 
-local function onRemainingChanged(entry)
-    local old = entry.remaining
-    local new = Ores.readRemaining(entry)
-    entry.remaining = new
+local function notifyChange(entry, old)
     entry.lastChange = U.now()
     Ores.dataVersion = Ores.dataVersion + 1
-    for _, fn in ipairs(Ores.remainingListeners) do pcall(fn, entry, old, new) end
+    for _, fn in ipairs(Ores.remainingListeners) do pcall(fn, entry, old, entry.remaining) end
+end
+
+local function onRemainingChanged(entry)
+    local old = entry.remaining
+    entry.remaining = Ores.readRemaining(entry)
+    notifyChange(entry, old)
 end
 
 function Ores.resolveRemaining(entry)
@@ -1136,6 +1488,8 @@ function Ores.refreshGeometry(entry)
     local ok = pcall(function()
         if node:IsA("BasePart") then
             entry.boxCF, entry.boxSize = node.CFrame, node.Size
+        elseif entry.mesh and U.alive(entry.mesh) then
+            entry.boxCF, entry.boxSize = entry.mesh.CFrame, entry.mesh.Size
         else
             entry.boxCF, entry.boxSize = node:GetBoundingBox()
         end
@@ -1153,13 +1507,30 @@ function Ores.refreshGeometry(entry)
     entry.geoAt = U.now()
 end
 
--- Mineable now: alive, and OreRemaining > 0 (or unknown, when unknown deposits are allowed; those
--- are still subject to progress verification and get blacklisted if mining shows no effect).
+function Ores.hasOre(entry)
+    local mesh = entry.mesh
+    return mesh ~= nil and U.alive(mesh) and (mesh == entry.node or mesh.Parent == entry.node)
+end
+
+-- Mineable now: alive with a known type, not suspended, and OreRemaining > 0. Without OreRemaining:
+-- layout B requires the ore mesh to be present; otherwise "allow unknown remaining" decides (such
+-- deposits are still verified by progress signals and blacklisted when mining shows no effect).
 function Ores.isAvailable(entry)
-    if entry.removed or not U.alive(entry.node) then return false end
+    if entry.removed or not U.alive(entry.node) or entry.kind == "Unknown" then return false end
+    local until_ = Ores.suspendedKinds[entry.kind]
+    if until_ and U.now() < until_ then return false end
     local r = entry.remaining
-    if r == nil then return Config.get("allowUnknownRemaining") end
-    return r > 0
+    if r ~= nil then return r > 0 end
+    if Ores.meshLayout then return Ores.hasOre(entry) end
+    return Config.get("allowUnknownRemaining")
+end
+
+function Ores.setKind(entry, kind, source)
+    entry.kindSource = source
+    if entry.kind == kind then return end
+    entry.kind = kind
+    if kind ~= "Unknown" then ensureKind(kind) end
+    Ores.dataVersion = Ores.dataVersion + 1
 end
 
 local function forgetMemoryNear(pos, radius)
@@ -1168,15 +1539,52 @@ local function forgetMemoryNear(pos, radius)
     end
 end
 
-function Ores.addDeposit(node, kind, container)
+-- Ore mesh removed (node exhausted) or re-added (respawned) under a deposit model.
+local function onDepositChild(entry, child, added)
+    if child.Name == "DepositInfo" and added and not entry.remainingObj and not entry.remainingAttrHost then
+        Ores.resolveRemaining(entry)
+        return
+    end
+    if not child:IsA("BasePart") then return end
+    if added then
+        if not Ores.hasOre(entry) and isOreMeshName(child.Name) then
+            entry.mesh = child
+            if entry.kind == "Unknown" or entry.kindSource == "folder name" then
+                local kind, source = Ores.resolveKind(entry.node, entry.containerKind)
+                Ores.setKind(entry, kind, source)
+            end
+            Ores.refreshGeometry(entry)
+            notifyChange(entry, entry.remaining)
+        end
+    elseif child == entry.mesh then
+        entry.mesh = Ores.findOreMesh(entry.node)
+        notifyChange(entry, entry.remaining)
+    end
+end
+
+function Ores.addDeposit(node, containerKind, container)
     if Ores.deposits[node] then return Ores.deposits[node] end
-    local entry = {node = node, kind = kind, container = container, conns = {}, addedAt = U.now(),
-        lastChange = U.now(), attempts = 0}
+    local entry = {node = node, container = container, containerKind = containerKind, conns = {},
+        addedAt = U.now(), lastChange = U.now(), attempts = 0}
     Ores.deposits[node] = entry
     Ores.depositCount = Ores.depositCount + 1
-    ensureKind(kind).total = ensureKind(kind).total + 1
+    entry.mesh = Ores.findOreMesh(node)
+    entry.kind, entry.kindSource = Ores.resolveKind(node, containerKind)
+    if entry.kind ~= "Unknown" then ensureKind(entry.kind) end
     Ores.refreshGeometry(entry)
     Ores.resolveRemaining(entry)
+    if entry.mesh and entry.mesh ~= node and not entry.remainingObj and not entry.remainingAttrHost
+        and not Ores.meshLayout then
+        Ores.meshLayout = true
+        Log.info("Ores", "Deposits expose no OreRemaining; tracking exhaustion through their ore mesh (" ..
+            entry.mesh.Name .. ")")
+    end
+    if not node:IsA("BasePart") then
+        entry.conns[#entry.conns + 1] = SESSION:connect(node.ChildAdded,
+            function(child) onDepositChild(entry, child, true) end, "Deposit.ChildAdded")
+        entry.conns[#entry.conns + 1] = SESSION:connect(node.ChildRemoved,
+            function(child) onDepositChild(entry, child, false) end, "Deposit.ChildRemoved")
+    end
     if entry.pos then forgetMemoryNear(entry.pos, 12) end
     Ores.dataVersion = Ores.dataVersion + 1
     return entry
@@ -1190,11 +1598,10 @@ function Ores.removeDeposit(node, why)
     entry.removed = true
     Ores.deposits[node] = nil
     Ores.depositCount = Ores.depositCount - 1
-    local record = Ores.kinds[entry.kind]
-    if record then record.total = math.max(0, record.total - 1) end
     -- A deposit that vanishes far away with ore left was most likely streamed out: remember it.
     local here = Char.position()
-    if Config.get("rememberSites") and entry.pos and here and (entry.remaining == nil or entry.remaining > 0)
+    local hadOre = (entry.remaining == nil or entry.remaining > 0) and (not Ores.meshLayout or entry.mesh ~= nil)
+    if Config.get("rememberSites") and entry.pos and here and hadOre and entry.kind ~= "Unknown"
         and U.dist(here, entry.pos) > 150 and #Ores.memory < 300 then
         forgetMemoryNear(entry.pos, 12)
         Ores.memory[#Ores.memory + 1] = {pos = entry.pos, kind = entry.kind, at = U.now()}
@@ -1203,14 +1610,38 @@ function Ores.removeDeposit(node, why)
     Log.debug("Ores", "Deposit removed (" .. tostring(why) .. "): " .. entry.kind)
 end
 
+-- Classifies a child of a container: "deposit", "container" or nil.
+local function classify(child, depth, containerKind)
+    if child:IsA("BasePart") then
+        if Ores.findOreMesh(child) or containerKind then return "deposit" end
+        return nil
+    end
+    if child:IsA("Folder") or child:IsA("Configuration") then
+        if child.Name == "DepositInfo" then return nil end
+        return depth < MAX_CONTAINER_DEPTH and "container" or nil
+    end
+    if child:IsA("Model") then
+        if hasDepositInfo(child) or Ores.findOreMesh(child) then return "deposit" end
+        for _, sub in ipairs(child:GetChildren()) do
+            if sub:IsA("Model") and (hasDepositInfo(sub) or Ores.findOreMesh(sub)) then
+                return depth < MAX_CONTAINER_DEPTH and "container" or nil
+            end
+        end
+        -- No evidence yet: e.g. an exhausted node whose ore mesh is gone. Tracked (unavailable) so a
+        -- respawning ore mesh is noticed.
+        return "deposit"
+    end
+    return nil
+end
+
 local watchContainer
 
 local function addChild(child, kind, container, depth)
-    local class = classify(child, depth)
+    local class = classify(child, depth, kind)
     if class == "deposit" then
         Ores.addDeposit(child, kind, container)
     elseif class == "container" then
-        watchContainer(child, kind, depth + 1)
+        watchContainer(child, Ores.oreWordKind(child.Name) or kind, depth + 1)
     end
 end
 
@@ -1239,15 +1670,12 @@ function Ores.unwatch(container)
 end
 
 local function addCategory(child)
-    if child:IsA("Model") and hasDepositInfo(child) then
-        -- Flat layout: deposits directly under the root, kind derived from the deposit's name.
-        Ores.addDeposit(child, Ores.kindName(child.Name), Ores.root)
+    if (child:IsA("Model") and (hasDepositInfo(child) or Ores.findOreMesh(child))) or
+        (child:IsA("BasePart") and Ores.findOreMesh(child)) then
+        Ores.addDeposit(child, nil, Ores.root) -- flat layout: deposits directly under the root
     elseif child:IsA("Folder") or child:IsA("Model") or child:IsA("Configuration") then
-        local kind = Ores.kindName(child.Name)
-        ensureKind(kind)
-        watchContainer(child, kind, 1)
-    elseif child:IsA("BasePart") then
-        Ores.addDeposit(child, Ores.kindName(child.Name), Ores.root)
+        -- Type folder ("Copper") or generic grouping folder ("OreDeposits" -> no type).
+        watchContainer(child, Ores.specificKind(child.Name), 1)
     end
 end
 
@@ -1263,7 +1691,8 @@ end
 function Ores.attach(root, label, how)
     Ores.detach()
     Ores.root = root
-    Ores.rootLabel = label .. (how == "heuristic" and " (heuristic match)" or "")
+    Ores.rootHow = how
+    Ores.rootLabel = label .. (how ~= "path" and (" (found by " .. how .. ")") or "")
     Ores.rootConns[1] = SESSION:connect(root.ChildAdded, function(child) addCategory(child) end, "Mining.ChildAdded")
     Ores.rootConns[2] = SESSION:connect(root.ChildRemoved, function(child)
         if Ores.containers[child] then Ores.unwatch(child) end
@@ -1291,7 +1720,8 @@ function Ores.maintain(force)
                 Ores.attach(root, label, how)
             else
                 Ores.status = "Mining folder not found (not replicated yet?)"
-                Log.warn("Ores", "Mining root not found; checked configured path and fallbacks", "noroot", 60)
+                Log.warn("Ores", "Mining root not found; checked configured paths, folder names and ore-named parts",
+                    "noroot", 60)
             end
         end
         return
@@ -1308,6 +1738,24 @@ function Ores.maintain(force)
     Ores.status = string.format("Watching %s: %d types, %d deposits", Ores.rootLabel, #Ores.kindList, Ores.depositCount)
 end
 
+-- Kind-level learning: a type whose deposits show no reaction at all three times in a row is skipped
+-- for 10 minutes (most likely the pickaxe tier is too low for it).
+function Ores.kindResult(kind, reacted)
+    if reacted then
+        Ores.kindStrikes[kind] = 0
+        return
+    end
+    local n = (Ores.kindStrikes[kind] or 0) + 1
+    Ores.kindStrikes[kind] = n
+    if n >= 3 then
+        Ores.kindStrikes[kind] = 0
+        Ores.suspendedKinds[kind] = U.now() + 600
+        local tier = Ores.TIERS[kind]
+        Log.warn("Ores", string.format("%s deposits did not react to mining 3 times in a row; skipping %s for 10 minutes.%s",
+            kind, kind, tier and (" The community wiki lists pickaxe tier " .. tier .. " as the minimum for " .. kind .. ".") or ""))
+    end
+end
+
 -- Per-kind counters for the GUI (throttled).
 function Ores.refreshStats(force)
     local now = U.now()
@@ -1321,7 +1769,8 @@ function Ores.refreshStats(force)
     for _, entry in pairs(Ores.deposits) do
         local record = Ores.kinds[entry.kind]
         if record then
-            local depleted = entry.remaining ~= nil and entry.remaining <= 0
+            local depleted = (entry.remaining ~= nil and entry.remaining <= 0)
+                or (entry.remaining == nil and Ores.meshLayout and not Ores.hasOre(entry))
             if depleted then record.depleted = record.depleted + 1 end
             if not (depleted and hideDepleted) then record.total = record.total + 1 end
             if Ores.isAvailable(entry) then
@@ -1605,9 +2054,76 @@ local function strafe(hum, pos, toward, sign)
     pcall(function() hum:MoveTo(pos + side * 4 - unit * 1.5) end)
 end
 
+-- Movement drivers. "MoveTo" (Humanoid:MoveTo) is the default. TWW uses its own character
+-- controller (public scripts show a PlayerCharacter module), so if the character does not move at
+-- all on two consecutive waypoints the driver switches to "Move": Humanoid:Move toward the waypoint
+-- every frame, bound after the game's controller. The driver that produced movement is remembered.
+local DRIVER_BIND = "TWWProspectorMoveDriver"
+Nav.driver, Nav.driverVerified, Nav.zeroMoves = "MoveTo", false, 0
+SESSION:onCleanup(function()
+    if RunService then pcall(function() RunService:UnbindFromRenderStep(DRIVER_BIND) end) end
+end)
+
+function Nav.startDriver(target)
+    if Nav.driver ~= "Move" or not RunService then return function() end end
+    local function step()
+        local _, h, r = Char.get()
+        if not h then return end
+        local d = Vector3.new(target.X - r.Position.X, 0, target.Z - r.Position.Z)
+        if d.Magnitude > 0.5 then pcall(function() h:Move(d.Unit, false) end) end
+    end
+    local bound = pcall(function()
+        RunService:BindToRenderStep(DRIVER_BIND, Enum.RenderPriority.Character.Value + 1, step)
+    end)
+    local conn = nil
+    if not bound then conn = SESSION:connect(RunService.Heartbeat, step, "MoveDriver") end
+    return function()
+        if bound then pcall(function() RunService:UnbindFromRenderStep(DRIVER_BIND) end) end
+        if conn then SESSION:disconnect(conn) end
+        local _, h = Char.get()
+        if h then pcall(function() h:Move(Vector3.new(0, 0, 0), false) end) end
+    end
+end
+
+function Nav.noteDisplacement(moved, result)
+    if moved >= 1.5 then
+        Nav.zeroMoves = 0
+        if not Nav.driverVerified then
+            Nav.driverVerified = true
+            Learned.set("moveDriver", Nav.driver)
+        end
+        return
+    end
+    if Nav.driverVerified or result == "reached" or result == "arrived_early" or result == "cancelled"
+        or result == "character_lost" or Char.controlState() ~= "ok" then
+        return
+    end
+    Nav.zeroMoves = Nav.zeroMoves + 1
+    if Nav.zeroMoves >= 2 then
+        Nav.zeroMoves = 0
+        local old = Nav.driver
+        Nav.driver = old == "MoveTo" and "Move" or "MoveTo"
+        Log.warn("Nav", "The character did not move with " .. old .. "; switching movement driver to " .. Nav.driver)
+    end
+end
+
+local walkToInner
+
 -- Walks to a single waypoint. Returns "reached" | "arrived_early" | "stuck" | "timeout" |
 -- "character_lost" | "no_control" | "target_invalid" | "cancelled".
 function Nav.walkTo(target, jump, token, opts, isLast)
+    local _, _, root = Char.get()
+    local startPos = root and root.Position
+    local stopDriver = Nav.startDriver(target)
+    local ok, result = pcall(walkToInner, target, jump, token, opts, isLast)
+    stopDriver()
+    if not ok then error(result, 0) end
+    local _, _, after = Char.get()
+    if startPos and after then Nav.noteDisplacement(U.flatDist(startPos, after.Position), result) end
+    return result
+end
+
+walkToInner = function(target, jump, token, opts, isLast)
     local _, hum, root = Char.get()
     if not hum then return "character_lost" end
     local control = Char.controlState()
@@ -1842,7 +2358,7 @@ function Probe:signalSummary()
 end
 
 -- ==== MODULE: Miner ======================================================================
-Miner = {tool = nil, status = "Idle", lastOutcome = "-", cameraSaved = false, cameraType = nil}
+Miner = {handle = nil, autoMethod = nil, noReaction = 0, status = "Idle", lastOutcome = "-", cameraSaved = false, cameraType = nil}
 local SWING_HOLD = 0.12
 
 -- Candidate standing spots in a ring just outside the deposit footprint, nearest side first.
@@ -1921,30 +2437,41 @@ function Miner.restoreCamera()
 end
 SESSION:onCleanup(Miner.restoreCamera)
 
--- Optional simulated mouse click at the deposit's screen position (VirtualInputManager).
+-- Simulated mouse click on the deposit's ore mesh (or box centre) at its current screen position.
 function Miner.click(entry)
-    if not Exec.vim then return false, "VirtualInputManager unavailable" end
     local cam = Workspace.CurrentCamera
     if not cam then return false, "no camera" end
+    local target = (Ores.hasOre(entry) and entry.mesh.Position) or entry.pos
     local ok, point, onScreen = pcall(function()
-        local v, visible = cam:WorldToViewportPoint(entry.pos)
+        local v, visible = cam:WorldToViewportPoint(target)
         return v, visible
     end)
     if not ok or not onScreen then return false, "deposit not on screen" end
-    return pcall(function()
-        Exec.vim:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
-        task.wait(0.05)
-        Exec.vim:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
-    end)
+    return Input.click(point.X, point.Y)
 end
 
-function Miner.activate(tool, entry)
-    local method = Config.get("interactMethod")
+-- "Auto" picks Tool:Activate for a Roblox Tool and a mouse click for a game item, prefers whatever
+-- worked before in this place, and is switched inside Miner.mine when a method gets no reaction.
+function Miner.effectiveMethod(handle)
+    local m = Config.get("interactMethod")
+    if m ~= "Auto" then return m end
+    local preferred = Miner.autoMethod or Learned.get("interact")
+    if preferred == "Tool" and handle.kind == "tool" then return "Tool" end
+    if preferred == "Click" and Input.available() then return "Click" end
+    if handle.kind == "tool" then return "Tool" end
+    return "Click"
+end
+
+function Miner.activate(handle, entry, method)
     local anyOk, lastErr = false, nil
-    if method == "Tool" or method == "Both" then
-        local ok, err = pcall(function() tool:Activate() end)
-        anyOk = anyOk or ok
-        if not ok then lastErr = err end
+    if (method == "Tool" or method == "Both") then
+        if handle.kind == "tool" then
+            local ok, err = pcall(function() handle.tool:Activate() end)
+            anyOk = anyOk or ok
+            if not ok then lastErr = err end
+        else
+            lastErr = "pickaxe is a game item, not a Roblox Tool"
+        end
     end
     if method == "Click" or method == "Both" then
         local ok, err = Miner.click(entry)
@@ -1954,35 +2481,51 @@ function Miner.activate(tool, entry)
     return anyOk, lastErr
 end
 
+local function deactivate(handle)
+    if handle and handle.kind == "tool" then pcall(function() handle.tool:Deactivate() end) end
+end
+
 -- Mines one deposit until it is depleted or a stop condition occurs. Returns a result table:
 --   outcome: depleted | stalled | no_yield | out_of_range | tool_lost | inventory_full |
 --            target_gone | character_lost | timeout | cancelled
 --   yields: verified ore units observed, activity: weak progress signals observed.
 function Miner.mine(entry, token)
     local probe = Probe.attach(entry)
-    local inv0 = Inventory.snapshot()
+    local handle = Miner.handle
     local started = U.now()
     local lastProgress = started
     local result = {outcome = nil, yields = 0, activity = 0, swings = 0, startRemaining = probe.lastRemaining}
     local interval = Config.get("swingInterval")
     local stallTimeout = Config.get("stallTimeout")
+    local method = Miner.effectiveMethod(handle)
+    local quietSwings, lastActivity = 0, 0
     Inventory.watchDrops(true)
-    Miner.status = "Mining " .. entry.kind
+    Miner.status = "Mining " .. entry.kind .. " (" .. method .. ")"
 
     local function finish(outcome)
         probe:detach()
         Inventory.watchDrops(false)
-        pcall(function() if Miner.tool then Miner.tool:Deactivate() end end)
+        deactivate(handle)
         result.outcome = outcome
         result.activity = probe.activity
         result.signals = probe:signalSummary()
         result.elapsed = U.now() - started
+        result.method = method
         Miner.lastOutcome = outcome
         Miner.status = "Last: " .. outcome
         return result
     end
 
-    local lastInv = inv0
+    local function verified(n)
+        result.yields = result.yields + n
+        Stats.recordYield(entry.kind, n)
+        lastProgress = U.now()
+        Inventory.lastYieldAt = U.now()
+        Learn.onEvent("yield", n)
+        if Config.get("interactMethod") == "Auto" then Learned.set("interact", method) end
+    end
+
+    local lastInv = Inventory.snapshot()
     while true do
         if token:dead() then
             return finish(token.reason == "timeout" and "timeout" or "cancelled")
@@ -1992,33 +2535,38 @@ function Miner.mine(entry, token)
             return finish("target_gone")
         end
         local gained, remaining = probe:pollRemaining()
-        if gained > 0 then
-            result.yields = result.yields + gained
-            Stats.recordYield(entry.kind, gained)
-            lastProgress = U.now()
-        end
+        if gained > 0 then verified(gained) end
         if remaining ~= nil and remaining <= 0 then return finish("depleted") end
+        if remaining == nil and Ores.meshLayout and not Ores.hasOre(entry) then
+            -- Layout B: the game removed the ore mesh, i.e. the node is exhausted.
+            if result.yields > 0 or probe.activity > 0 then
+                if result.yields == 0 then Learn.onEvent("yield", 1) end
+                return finish("depleted")
+            end
+            return finish("target_gone")
+        end
         local _, _, root = Char.get()
         if not root then return finish("character_lost") end
         if not Miner.inRange(entry, root.Position) then return finish("out_of_range") end
-        if not Tools.isEquipped(Miner.tool) then return finish("tool_lost") end
+        if not Tools.isEquipped(handle) then return finish("tool_lost") end
         local sell, why = Inventory.shouldSell()
         if sell then
             result.sellReason = why
             return finish("inventory_full")
         end
 
+        Learn.tick()
         Miner.face(entry)
         Miner.aim(entry)
-        local ok, err = Miner.activate(Miner.tool, entry)
+        local ok, err = Miner.activate(handle, entry, method)
         Stats.swings = Stats.swings + 1
         result.swings = result.swings + 1
         if not ok then
             Stats.failedInteractions = Stats.failedInteractions + 1
-            Log.warn("Miner", "Interaction failed: " .. tostring(err), "swingerr", 15)
+            Log.warn("Miner", "Interaction failed (" .. method .. "): " .. tostring(err), "swingerr", 15)
         end
         if not token:sleep(SWING_HOLD) then return finish("cancelled") end
-        pcall(function() Miner.tool:Deactivate() end)
+        deactivate(handle)
         if not token:sleep(math.max(0.05, interval - SWING_HOLD)) then
             return finish(token.reason == "timeout" and "timeout" or "cancelled")
         end
@@ -2029,15 +2577,33 @@ function Miner.mine(entry, token)
         lastInv = inv
         local remGain = probe:pollRemaining()
         if remGain > 0 then
-            result.yields = result.yields + remGain
-            Stats.recordYield(entry.kind, remGain)
-            lastProgress = U.now()
+            verified(remGain)
         elseif invGain > 0 then
-            result.yields = result.yields + invGain
-            Stats.recordYield(entry.kind, invGain)
-            lastProgress = U.now()
+            verified(invGain)
+        end
+        if probe.activity > lastActivity then
+            lastActivity = probe.activity
+            quietSwings = 0
+            if Config.get("interactMethod") == "Auto" then Learned.set("interact", method) end
+        elseif remGain == 0 and invGain == 0 then
+            quietSwings = quietSwings + 1
+        else
+            quietSwings = 0
         end
         if probe.lastActivity > lastProgress then lastProgress = probe.lastActivity end
+
+        -- Auto mode: no reaction at all after 6 swings -> try the other interaction method once.
+        if Config.get("interactMethod") == "Auto" and quietSwings >= 6 and not result.switched then
+            local alt = nil
+            if method == "Tool" and Input.available() then alt = "Click"
+            elseif method == "Click" and handle.kind == "tool" then alt = "Tool" end
+            if alt then
+                Log.info("Miner", "No reaction to " .. method .. " interaction after 6 swings; trying " .. alt)
+                method, Miner.autoMethod, result.switched = alt, alt, true
+                quietSwings, lastProgress = 0, U.now()
+                Miner.status = "Mining " .. entry.kind .. " (" .. method .. ")"
+            end
+        end
 
         local now = U.now()
         if now - lastProgress > stallTimeout then
@@ -2048,6 +2614,230 @@ function Miner.mine(entry, token)
             return finish("no_yield")
         end
         if now - started > Config.get("mineTimeout") then return finish("timeout") end
+    end
+end
+
+-- ==== MODULE: Learn ======================================================================
+-- Differential discovery of the inventory counter and money display WITHOUT assuming names.
+-- Numbers shown in PlayerGui ("12/40", "$1,250", "x17", "17") and numeric values/attributes under the
+-- player are sampled. A candidate that was stable across two snapshots before an event and moved in
+-- the expected direction right after it gains evidence:
+--   verified ore yield -> the inventory counter rises;  verified sale -> money rises, inventory falls.
+-- Two consistent observations promote a candidate. Results are stored per place (Learned) and feed
+-- Inventory (capacity, full detection by "ore mined but counter unchanged") and Wallet (sale checks).
+Learn = {candidates = {}, lastCollect = -1000, lastTick = 0, ring = {}, invEvidence = {},
+    moneyEvidence = {}, inv = nil, money = nil, noGain = 0}
+
+local function readGuiNumber(label)
+    local text = label.Text or ""
+    local a, b = U.parseFraction(text)
+    if a then return a, b, "fraction" end
+    local money = U.parseMoney(text)
+    if money then return money, nil, "money" end
+    local n = string.match(text, "^%s*[xX]?%s*([%d,]+%.?%d*)%s*$")
+    if n then return tonumber((string.gsub(n, ",", ""))), nil, "number" end
+    return nil
+end
+
+local function guiPath(inst)
+    local names, node = {}, inst
+    while node and node ~= PlayerGui do
+        table.insert(names, 1, node.Name)
+        node = node.Parent
+    end
+    if node ~= PlayerGui then return nil end
+    return table.concat(names, "/")
+end
+
+local LEARN_MONEY_HINTS = {"money", "cash", "dollar", "bank", "wallet", "balance", "bucks", "coins", "funds"}
+
+local function looksLikeMoney(c)
+    if c.mode == "money" then return true end
+    local lp = string.lower(c.path or "")
+    for _, w in ipairs(LEARN_MONEY_HINTS) do if U.has(lp, w) then return true end end
+    return false
+end
+
+-- Candidate: {key, kind = "gui" | "value" | "attr", inst, holder, attr, path, mode}
+function Learn.collect(force)
+    if not force and U.now() - Learn.lastCollect < 20 then return end
+    Learn.lastCollect = U.now()
+    local list = {}
+    if PlayerGui then
+        local ok, desc = pcall(function() return PlayerGui:GetDescendants() end)
+        if ok then
+            for _, inst in ipairs(desc) do
+                if #list >= 700 then break end
+                if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and not U.isDescendantOf(inst, UI and UI.root) then
+                    local v, _, mode = readGuiNumber(inst)
+                    if v then list[#list + 1] = {key = inst, kind = "gui", inst = inst, mode = mode, path = guiPath(inst)} end
+                end
+            end
+        end
+    end
+    if LocalPlayer then
+        local ok, desc = pcall(function() return LocalPlayer:GetDescendants() end)
+        if ok then
+            local n = 0
+            for _, inst in ipairs(desc) do
+                if n >= 300 then break end
+                if (inst:IsA("IntValue") or inst:IsA("NumberValue")) and not (PlayerGui and inst:IsDescendantOf(PlayerGui)) then
+                    n = n + 1
+                    list[#list + 1] = {key = inst, kind = "value", inst = inst, mode = "number",
+                        path = "value " .. U.fullName(inst)}
+                end
+            end
+        end
+        for _, holder in ipairs({LocalPlayer, Char.character}) do
+            local okAttrs, attrs = pcall(function() return holder:GetAttributes() end)
+            if okAttrs then
+                local label = holder == LocalPlayer and "Player" or "Character"
+                for name, value in pairs(attrs) do
+                    if type(value) == "number" then
+                        list[#list + 1] = {key = label .. "@" .. name, kind = "attr", holder = holder, attr = name,
+                            mode = "number", path = label .. "@" .. name}
+                    end
+                end
+            end
+        end
+    end
+    Learn.candidates = list
+end
+
+function Learn.read(c)
+    if c.kind == "gui" then
+        if not U.alive(c.inst) then return nil end
+        local v, cap = readGuiNumber(c.inst)
+        return v, cap
+    elseif c.kind == "value" then
+        if not U.alive(c.inst) then return nil end
+        local ok, v = pcall(function() return c.inst.Value end)
+        return ok and tonumber(v) or nil
+    end
+    local ok, v = pcall(function() return c.holder:GetAttribute(c.attr) end)
+    return ok and tonumber(v) or nil
+end
+
+function Learn.snapshot()
+    local snap = {t = U.now(), values = {}}
+    for _, c in ipairs(Learn.candidates) do
+        local v = Learn.read(c)
+        if v then snap.values[c.key] = v end
+    end
+    return snap
+end
+
+-- Called every swing: keeps the last three snapshots as the pre-event baseline.
+function Learn.tick()
+    Learn.collect(false)
+    local now = U.now()
+    if now - Learn.lastTick < 0.7 then return end
+    Learn.lastTick = now
+    local ring = Learn.ring
+    ring[#ring + 1] = Learn.snapshot()
+    if #ring > 3 then table.remove(ring, 1) end
+end
+
+-- Candidates stable across both baselines whose value moved afterwards: list of {c, delta}.
+local function stableChanges(b1, b2, after)
+    local out = {}
+    for _, c in ipairs(Learn.candidates) do
+        local v1, v2, v3 = b1.values[c.key], b2.values[c.key], after.values[c.key]
+        if v1 and v2 and v3 and v1 == v2 and v3 ~= v2 then out[#out + 1] = {c = c, delta = v3 - v2} end
+    end
+    return out
+end
+
+local function promote(which, c)
+    if which == "inv" then
+        Learn.inv = c
+        Learned.set("inventoryPath", c.path)
+        Log.info("Learn", "Learned the inventory counter by observation: " .. tostring(c.path))
+        Inventory.scan(true)
+    else
+        Learn.money = c
+        Learned.set("moneyPath", c.path)
+        Wallet.source, Wallet.label = function() return (Learn.read(c)) end, "Learned: " .. tostring(c.path)
+        Log.info("Learn", "Learned the money display from a sale: " .. tostring(c.path))
+    end
+end
+
+-- Evaluates a verified yield one and a half seconds later, against the pre-yield baseline.
+function Learn.onEvent(kind, amount)
+    local ring = Learn.ring
+    if kind ~= "yield" or #ring < 2 then return end
+    local b1, b2 = ring[#ring - 1], ring[#ring]
+    SESSION:spawn("Learn.yield", function()
+        task.wait(1.5)
+        local after = Learn.snapshot()
+        local invRose = false
+        for _, ch in ipairs(stableChanges(b1, b2, after)) do
+            if ch.delta > 0 and not looksLikeMoney(ch.c) then
+                local e = (Learn.invEvidence[ch.c.key] or 0) + 1
+                Learn.invEvidence[ch.c.key] = e
+                if Learn.inv == ch.c then invRose = true end
+                if not Learn.inv and e >= 2 and ch.c.mode == "fraction" then promote("inv", ch.c) end
+            end
+        end
+        -- Correlation check: ore was verifiably mined but the learned counter did not move.
+        if Learn.inv and U.alive(Learn.inv.inst or Learn.inv.holder) then
+            if invRose then
+                Learn.noGain = 0
+            else
+                Learn.noGain = Learn.noGain + 1
+                if Learn.noGain >= 2 then
+                    Learn.noGain = 0
+                    Inventory.markFull("ore was mined twice but the inventory counter did not change")
+                end
+            end
+        end
+    end)
+end
+
+-- Sale evaluation against baselines taken right before the interaction. commit=true records evidence
+-- and may promote candidates; returns a verification text when money rose or inventory fell.
+function Learn.evaluateSale(b1, b2, after, commit, countMoney)
+    local verdict = nil
+    for _, ch in ipairs(stableChanges(b1, b2, after)) do
+        local c = ch.c
+        if ch.delta > 0 and looksLikeMoney(c) then
+            verdict = verdict or ("money display " .. tostring(c.path) .. " rose by " .. U.num(ch.delta))
+            if commit then
+                if countMoney then Stats.moneyEarned = Stats.moneyEarned + ch.delta end
+                Learn.moneyEvidence[c.key] = (Learn.moneyEvidence[c.key] or 0) + 2
+                if not Learn.money then promote("money", c) end
+            end
+        elseif ch.delta > 0 then
+            if commit then
+                local e = (Learn.moneyEvidence[c.key] or 0) + 1
+                Learn.moneyEvidence[c.key] = e
+                if e >= 2 and not Learn.money then promote("money", c) end
+            end
+        elseif ch.delta < 0 and (c == Learn.inv or c.mode == "fraction") then
+            verdict = verdict or ("inventory counter " .. tostring(c.path) .. " fell by " .. U.num(-ch.delta))
+        end
+    end
+    return verdict
+end
+
+-- True when some money-like or "N/M" display exists, i.e. a sale could be observed at all.
+function Learn.canObserveSale()
+    for _, c in ipairs(Learn.candidates) do
+        if looksLikeMoney(c) or c.mode == "fraction" then return true end
+    end
+    return false
+end
+
+-- Re-binds counters learned in an earlier session (paths stored per place).
+function Learn.restore()
+    Learn.collect(true)
+    local invPath, moneyPath = Learned.get("inventoryPath"), Learned.get("moneyPath")
+    for _, c in ipairs(Learn.candidates) do
+        if invPath and c.path == invPath and not Learn.inv then Learn.inv = c end
+        if moneyPath and c.path == moneyPath and not Learn.money then
+            Learn.money = c
+            Wallet.source, Wallet.label = function() return (Learn.read(c)) end, "Learned: " .. tostring(c.path)
+        end
     end
 end
 
@@ -2067,6 +2857,8 @@ Inventory = {
     dropConn = nil,
     guiConn = nil,
     depositsSinceSell = 0,
+    dropsObserved = 0,
+    lastYieldAt = -1000,
 }
 
 local INV_WORDS = {inventory = 4, backpack = 3, capacity = 4, bag = 3, bags = 3, slots = 3, slot = 2,
@@ -2193,6 +2985,15 @@ function Inventory.scan(force)
         end
     end
     table.sort(candidates, function(a, b) return a.score > b.score end)
+    local learned = Learn.inv
+    if learned and U.alive(learned.inst or learned.holder) then
+        table.insert(candidates, 1, {kind = "learned", score = 1000, label = "Learned " .. tostring(learned.path),
+            read = function()
+                local v, cap = Learn.read(learned)
+                if v and cap then return v, cap end
+                return nil
+            end})
+    end
     Inventory.candidates = candidates
     Inventory.messageLabels = messages
     if Inventory.choice > #candidates then Inventory.choice = 0 end
@@ -2337,28 +3138,39 @@ function Inventory.resetAfterSale()
 end
 
 -- Ground-drop detection, only active while mining.
-local DROP_PARENT_WORDS = {"drop", "item", "loot", "debris", "pickup"}
+-- Community wiki (Ores and Gems, v3.7.5): "If your inventory is full, the ore will drop to the ground
+-- instead" and nodes can drop gems instead of ore. A new ore- or gem-named object appearing next to the
+-- player while mining (outside the Mining tree and outside any character) is treated as "inventory full".
 local function checkDroppedItem(inst)
     if not U.alive(inst) then return end
-    local parent = inst.Parent
-    local parentOk = parent == Workspace
-    if not parentOk and parent and parent:IsA("Folder") then
-        local pname = string.lower(parent.Name)
-        for _, w in ipairs(DROP_PARENT_WORDS) do if U.has(pname, w) then parentOk = true break end end
-    end
-    if not parentOk and not inst:IsA("Tool") then return end
     if Ores.root and inst:IsDescendantOf(Ores.root) then return end
-    if Char.character and inst:IsDescendantOf(Char.character) then return end
     if Visual.folder and inst:IsDescendantOf(Visual.folder) then return end
-    local lname = string.lower(inst.Name)
-    local matched = false
-    for _, kind in ipairs(Ores.kindList) do
-        if U.has(lname, string.lower(kind)) then matched = true break end
+    for _, model in ipairs(Tools.characterModels()) do
+        if inst:IsDescendantOf(model) then return end
     end
-    if not matched then return end
+    local entities = Workspace:FindFirstChild("WORKSPACE_Entities")
+    local playerModels = entities and entities:FindFirstChild("Players")
+    if playerModels and inst:IsDescendantOf(playerModels) then return end
+    if Players then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character and inst:IsDescendantOf(plr.Character) then return end
+        end
+    end
+    local named = Ores.isGemOrOreName(inst.Name)
+    if not named then
+        local lname = string.lower(inst.Name)
+        for _, kind in ipairs(Ores.kindList) do
+            if U.has(lname, string.lower(kind)) then named = true break end
+        end
+    end
+    if not named then return end
     local p, here = U.positionOf(inst), Char.position()
-    if p and here and U.dist(p, here) < 25 then
-        Inventory.markFull("mined ore dropped on the ground (" .. inst.Name .. ")")
+    if not (p and here) then return end
+    local d = U.dist(p, here)
+    local recentYield = U.now() - (Inventory.lastYieldAt or -1000) < 6
+    if d < 20 or (recentYield and d < 35) then
+        Inventory.dropsObserved = Inventory.dropsObserved + 1
+        Inventory.markFull("mined ore/gem dropped on the ground (" .. inst.Name .. ")")
     end
 end
 
@@ -2411,6 +3223,11 @@ end
 function Wallet.discover(force)
     if not force and U.now() - Wallet.lastDiscover < 20 then return end
     Wallet.lastDiscover = U.now()
+    if Learn.money and Learn.read(Learn.money) then
+        Wallet.source = function() return (Learn.read(Learn.money)) end
+        Wallet.label = "Learned: " .. tostring(Learn.money.path)
+        return
+    end
     Wallet.source, Wallet.label = nil, "Not detected"
     if not LocalPlayer then return end
     local stats = LocalPlayer:FindFirstChild("leaderstats")
@@ -2631,7 +3448,7 @@ function Sellers.rank()
         if pos then
             c.pos = pos
             c.dist = here and U.dist(here, pos) or math.huge
-            c.cost = c.dist - c.score * 4
+            c.cost = c.dist - c.score * 4 + Sellers.memoryAdjust(c)
             c.blocked = Sellers.blacklist:blocked(c.key)
             list[#list + 1] = c
         end
@@ -2648,6 +3465,48 @@ function Sellers.rank()
     end)
     Sellers.list = list
     return list
+end
+
+local function nearAny(list, pos, radius)
+    for _, t in ipairs(type(list) == "table" and list or {}) do
+        local v = U.tableToVec(t)
+        if v and U.dist(v, pos) < radius then return true end
+    end
+    return false
+end
+
+-- Per-place memory: sellers that paid are preferred, sellers that did not are tried last. A forum
+-- report says the Howling Peak merchant and the Hunter Shack did not buy loot, so those rank lower too.
+function Sellers.memoryAdjust(c)
+    c.knownGood = nearAny(Learned.get("goodSellers"), c.pos, 15)
+    c.knownBad = not c.knownGood and nearAny(Learned.get("badSellers"), c.pos, 15)
+    local adjust = (c.knownGood and -300 or 0) + (c.knownBad and 400 or 0)
+    local owner = c.prompt or c.building
+    if owner then
+        local text = ancestryText(owner, 6)
+        if U.has(text, "howling") or U.has(text, "hunter") then adjust = adjust + 250 end
+    end
+    return adjust
+end
+
+function Sellers.remember(c, good)
+    if not c or not c.pos then return end
+    local keep, drop = good and "goodSellers" or "badSellers", good and "badSellers" or "goodSellers"
+    local list = Learned.get(keep)
+    if type(list) ~= "table" then list = {} end
+    if not nearAny(list, c.pos, 15) then
+        list[#list + 1] = U.vecToTable(c.pos)
+        while #list > 20 do table.remove(list, 1) end
+    end
+    Learned.set(keep, list)
+    local other = Learned.get(drop)
+    if type(other) == "table" then
+        for i = #other, 1, -1 do
+            local v = U.tableToVec(other[i])
+            if v and U.dist(v, c.pos) < 15 then table.remove(other, i) end
+        end
+    end
+    Config.dirty = true
 end
 
 function Sellers.cycleManual()
@@ -2704,7 +3563,10 @@ local function promptRange(prompt)
     return math.max(3, range)
 end
 
-local function triggerPrompt(prompt, token)
+-- 1) optional executor fireproximityprompt, 2) ProximityPrompt:InputHoldBegin/End honouring
+-- HoldDuration, 3) if the prompt did not report Triggered: hold the prompt's own key (the wiki says
+-- "Sell Loot" is held with [F]) through VirtualInputManager, exactly as a player would.
+local function triggerPrompt(prompt, token, wasTriggered)
     if Config.get("useFirePrompt") and Exec.fireproximityprompt then
         local ok, err = pcall(Exec.fireproximityprompt, prompt)
         return ok, err, "fireproximityprompt"
@@ -2712,10 +3574,24 @@ local function triggerPrompt(prompt, token)
     local hold = 0
     pcall(function() hold = prompt.HoldDuration end)
     local ok, err = pcall(function() prompt:InputHoldBegin() end)
+    if ok then
+        token:sleep(hold + 0.2)
+        pcall(function() prompt:InputHoldEnd() end)
+        token:sleep(0.4)
+        if wasTriggered() then return true, nil, "InputHoldBegin/End" end
+    end
+    if Input.available() then
+        local key = nil
+        pcall(function() key = prompt.KeyboardKeyCode end)
+        if key then
+            Input.key(key, hold + 0.3, token)
+            token:sleep(0.4)
+            local keyName = tostring(key):gsub("^Enum%.KeyCode%.", "")
+            return true, nil, "holding key " .. keyName
+        end
+    end
     if not ok then return false, err, "InputHoldBegin" end
-    token:sleep(hold + 0.2)
-    local ok2, err2 = pcall(function() prompt:InputHoldEnd() end)
-    return ok2, err2, "InputHoldBegin/End"
+    return true, nil, "InputHoldBegin/End (no Triggered event)"
 end
 
 local SELL_BUTTON_PATTERNS = {"^%s*sell%s*all", "^%s*sell%s*ores?", "^%s*sell%s*everything", "^%s*sell%s*$"}
@@ -2806,10 +3682,14 @@ function Sellers.sell(c, token, onPhase)
 
     Inventory.read()
     local before = Inventory.snapshot()
+    Learn.collect(true)
+    local base1 = Learn.snapshot()
+    token:sleep(0.8)
+    local base2 = Learn.snapshot()
     local triggered = false
     local trigConn = SESSION:connect(prompt.Triggered, function() triggered = true end, "SellPrompt.Triggered")
     phase("Holding sell prompt")
-    local ok, err, method = triggerPrompt(prompt, token)
+    local ok, err, method = triggerPrompt(prompt, token, function() return triggered end)
     if not ok then
         SESSION:disconnect(trigConn)
         return "failed", "prompt interaction error (" .. tostring(method) .. "): " .. tostring(err)
@@ -2842,9 +3722,12 @@ function Sellers.sell(c, token, onPhase)
         elseif before.oreItems > 0 and after.oreItems < before.oreItems then
             verdict, detail = "sold", "ore items " .. U.num(before.oreItems) .. " -> " .. U.num(after.oreItems)
         end
+        local observed = Learn.evaluateSale(base1, base2, Learn.snapshot(), false)
+        if observed and not verdict then verdict, detail = "sold", observed end
         if verdict then break end
         task.wait(0.4)
     end
+    Learn.evaluateSale(base1, base2, Learn.snapshot(), verdict == "sold", before.money == nil)
     SESSION:disconnect(trigConn)
     local trigNote = triggered and " | prompt reported Triggered" or " | no Triggered event observed"
     if verdict == "sold" then
@@ -2852,7 +3735,7 @@ function Sellers.sell(c, token, onPhase)
         Sellers.blacklist:success(c.key)
         return "sold", detail .. " via " .. method .. trigNote .. dialogNote
     end
-    if not before.money and not before.used and before.oreItems == 0 then
+    if not before.money and not before.used and before.oreItems == 0 and not Learn.canObserveSale() then
         return "unverified", "no money/inventory signal available to confirm the sale" .. trigNote .. dialogNote
     end
     return "failed", "no money or inventory change after interaction" .. trigNote .. dialogNote
@@ -2865,8 +3748,7 @@ Targeting = {lastList = {}, info = "-", lastReason = "-"}
 local PRIORITY_WEIGHT = {0.45, 0.7, 1, 1.5, 2.4}
 
 function Targeting.valid(entry)
-    return entry ~= nil and not entry.removed and U.alive(entry.node)
-        and (entry.remaining == nil or entry.remaining > 0) and Ores.isSelected(entry.kind)
+    return entry ~= nil and Ores.isAvailable(entry) and Ores.isSelected(entry.kind)
 end
 
 function Targeting.contested(entry)
@@ -2894,7 +3776,7 @@ end
 function Targeting.candidates(here)
     local list = {}
     for node, entry in pairs(Ores.deposits) do
-        if entry.pos and Targeting.valid(entry) and Ores.isAvailable(entry) and not Ores.blacklist:blocked(node) then
+        if entry.pos and Targeting.valid(entry) and not Ores.blacklist:blocked(node) then
             local score, real = Targeting.score(entry, here)
             list[#list + 1] = {entry = entry, score = score, real = real}
         end
@@ -3193,19 +4075,27 @@ end
 
 H.EQUIPPING = function(ctx, token)
     if not Targeting.valid(ctx.target) then return "SELECTING_TARGET", "Target no longer available" end
-    local tool, why = Tools.ensureEquipped(token)
-    if tool then
-        Miner.tool = tool
-        return "MINING", "Mining " .. ctx.target.kind .. " with " .. tool.Name
+    local handle, why = Tools.ensureEquipped(token)
+    if handle then
+        Miner.handle = handle
+        return "MINING", "Mining " .. ctx.target.kind .. " with " .. tostring(Tools.lastName or "pickaxe")
+    end
+    if why == "cancelled" then return "EQUIPPING" end
+    if why == "manual_equip" then
+        Auto.halt("The pickaxe is a game item and this executor offers no input API to press its hotbar key. " ..
+            "Equip it by hand; automation resumes as soon as it is in your hand.",
+            function() return Tools.equippedVisual() ~= nil or (Tools.find()) ~= nil end)
+        return "PAUSED"
     end
     if why == "no_pickaxe" then
-        Auto.halt("No pickaxe found (name patterns: " .. tostring(Config.get("pickaxePatterns")) ..
-            "). Get a pickaxe; automation resumes automatically.", function() return (Tools.find()) ~= nil end)
+        Auto.halt("No pickaxe found: no Roblox Tool matching '" .. tostring(Config.get("pickaxePatterns")) ..
+            "', none in hand, and hotbar keys 1-9 did not equip one. Equip it or set Settings > Pickaxe hotbar slot; " ..
+            "automation resumes automatically.", Tools.available)
         return "PAUSED"
     end
     ctx.equipFails = (ctx.equipFails or 0) + 1
     if ctx.equipFails > 3 then
-        Auto.halt("Pickaxe could not be equipped (" .. tostring(why) .. ")", function() return (Tools.find()) ~= nil end)
+        Auto.halt("Pickaxe could not be equipped (" .. tostring(why) .. ")", Tools.available)
         return "PAUSED"
     end
     token:sleep(0.5)
@@ -3229,6 +4119,8 @@ H.MINING = function(ctx, token)
     if outcome ~= "cancelled" then Miner.restoreCamera() end
     if outcome == "depleted" then
         finishAttempt(ctx, true)
+        Ores.kindResult(target.kind, true)
+        Miner.noReaction = 0
         Stats.depleted = Stats.depleted + 1
         Ores.blacklist:success(target.node)
         Inventory.depositsSinceSell = Inventory.depositsSinceSell + 1
@@ -3253,8 +4145,19 @@ H.MINING = function(ctx, token)
     elseif outcome == "stalled" or outcome == "no_yield" or outcome == "timeout" then
         finishAttempt(ctx, ctx.attemptYields > 0)
         local duration = Ores.blacklist:mark(target.node, outcome)
-        Log.warn("Miner", string.format("%s on %s deposit (verified units %s, signals: %s); retry in %ds",
-            outcome, target.kind, U.num(ctx.attemptYields), tostring(result.signals), math.floor(duration)))
+        Log.warn("Miner", string.format("%s on %s deposit (verified units %s, signals: %s, method %s); retry in %ds",
+            outcome, target.kind, U.num(ctx.attemptYields), tostring(result.signals), tostring(result.method),
+            math.floor(duration)))
+        local reacted = (result.activity or 0) > 0 or ctx.attemptYields > 0
+        Ores.kindResult(target.kind, reacted)
+        Miner.noReaction = reacted and 0 or (Miner.noReaction + 1)
+        if Miner.noReaction >= 5 then
+            Miner.noReaction = 0
+            Auto.halt("5 deposits in a row showed no reaction at all to mining (method " .. tostring(result.method) ..
+                "). The interaction probably does not reach the game: check Settings > Interaction method and " ..
+                "Pickaxe hotbar slot, then resume.")
+            return "PAUSED"
+        end
         return "SELECTING_TARGET", "No verified progress (" .. outcome .. ")"
     elseif outcome == "target_gone" then
         finishAttempt(ctx, ctx.attemptYields > 0)
@@ -3329,6 +4232,7 @@ H.SELLING = function(ctx, token)
     Sellers.lastResult = outcome
     Sellers.lastDetail = detail
     if outcome == "sold" then
+        Sellers.remember(Sellers.current or c, true)
         Stats.sales = Stats.sales + 1
         ctx.sellFailures, ctx.seller = 0, nil
         Log.info("Sellers", "Sale verified: " .. detail)
@@ -3353,6 +4257,7 @@ H.SELLING = function(ctx, token)
         return "SCANNING", "Sale unverified; resuming mining"
     end
     Stats.salesFailed = Stats.salesFailed + 1
+    if outcome == "failed" then Sellers.remember(Sellers.current or c, false) end
     Sellers.blacklist:mark(c.key, outcome .. ": " .. tostring(detail))
     Log.warn("Sellers", "Sale " .. outcome .. " at " .. c.label .. ": " .. tostring(detail))
     ctx.sellFailures = (ctx.sellFailures or 0) + 1
@@ -4229,7 +5134,12 @@ function Pages.Ores(page)
             local on = Ores.isSelected(kind)
             UI.setColor(row.check, "BackgroundColor3", on and T.accent or T.bg)
             UI.setColor(row.name, "TextColor3", on and T.text or T.faint)
-            if record then
+            local tier = Ores.TIERS[kind]
+            set(row.name, kind .. (tier and ("  T" .. tier) or ""))
+            local suspended = Ores.suspendedKinds[kind] and U.now() < Ores.suspendedKinds[kind]
+            if suspended then
+                set(row.avail, "skipped")
+            elseif record then
                 set(row.avail, record.available .. " / " .. record.total)
                 UI.setColor(row.avail, "TextColor3", record.available > 0 and T.success or T.faint)
                 set(row.nearest, record.nearestDist and U.fmtDist(record.nearestDist) or "-")
@@ -4308,6 +5218,8 @@ function Pages.Inventory(page)
     w.items = UI.kv(inv, "Ore items in Backpack")
     w.full = UI.kv(inv, "Full signal")
     w.candidates = UI.kv(inv, "Capacity candidates found")
+    w.learnInv = UI.kv(inv, "Learned inventory counter")
+    w.drops = UI.kv(inv, "Ground drops observed")
     UI.buttonBar(inv, {
         {"RESCAN SOURCES", "ghost", function() Inventory.scan(true) Inventory.read() end},
         {"CYCLE SOURCE", "ghost", function()
@@ -4375,6 +5287,8 @@ function Pages.Inventory(page)
         set(w.items, s.oreItems)
         set(w.full, s.fullFlag and tostring(s.fullReason) or "none")
         set(w.candidates, #Inventory.candidates .. (Inventory.choice > 0 and (" (manual #" .. Inventory.choice .. ")") or " (auto)"))
+        set(w.learnInv, Learn.inv and tostring(Learn.inv.path) or "not yet (learned from mined ore)")
+        set(w.drops, Inventory.dropsObserved)
         set(w.status, Sellers.scanning and "Scanning..." or Sellers.status)
         set(w.current, Sellers.current and Sellers.current.label or "-")
         set(w.result, Sellers.lastResult)
@@ -4465,9 +5379,17 @@ function Pages.Settings(page)
     UI.stepper(mine, "Max time per deposit (s)", "mineTimeout", 10)
     UI.stepper(mine, "Mining range (studs)", "mineRange", 0.5)
     UI.toggle(mine, "Aim camera at deposit while mining", "aimCamera")
+    UI.stepper(mine, "Pickaxe hotbar slot (0 = find automatically)", "pickaxeSlot", 1)
     UI.textField(mine, "Pickaxe name patterns (comma separated)", "pickaxePatterns", "pickaxe,pick")
     UI.textField(mine, "Preferred pickaxe (exact tool name, optional)", "preferredPickaxe", "")
     UI.textField(mine, "Ore root path(s) under Workspace (; separated)", "orePaths", "WORKSPACE_Interactables/Mining")
+    UI.buttonBar(mine, {{"CLEAR LEARNED DATA FOR THIS PLACE", "ghost", function()
+        Learned.clear()
+        Learn.inv, Learn.money, Miner.autoMethod = nil, nil, nil
+        Nav.driverVerified, Nav.driver = false, "MoveTo"
+        Wallet.discover(true)
+        Log.info("Learn", "Learned data for this place cleared")
+    end}})
     local perf = UI.section(page, "Performance")
     UI.stepper(perf, "Ore root re-check interval (s)", "scanInterval", 1)
     UI.stepper(perf, "Interface refresh rate (Hz)", "uiRefreshRate", 1)
@@ -4482,6 +5404,16 @@ function Pages.Settings(page)
     w.results = UI.label(diag, "Self-tests have not run yet.", {Font = T.mono, TextSize = 11, TextWrapped = true,
         TextTruncate = Enum.TextTruncate.None, AutomaticSize = Enum.AutomaticSize.Y,
         TextYAlignment = Enum.TextYAlignment.Top})
+    local verifyCard = UI.section(page, "Game assumptions",
+        "Checks each assumption about TWW against this server and shows the evidence. SAVE WORLD REPORT writes " ..
+        "the structure it found to TWWProspector/world_report.txt and the clipboard.")
+    w.verify = UI.label(verifyCard, "", {Font = T.mono, TextSize = 11, TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.None, AutomaticSize = Enum.AutomaticSize.Y,
+        TextYAlignment = Enum.TextYAlignment.Top})
+    UI.buttonBar(verifyCard, {
+        {"VERIFY ASSUMPTIONS", "primary", function() SESSION:spawn("Verify", Verify.run) end},
+        {"SAVE WORLD REPORT", "ghost", function() SESSION:spawn("WorldReport", Verify.saveReport) end},
+    })
     UI.buttonBar(diag, {
         {"RUN SELF-TESTS", "primary", function() SESSION:spawn("SelfTest", SelfTest.run, true) end},
         {"COPY REPORT", "ghost", function()
@@ -4502,6 +5434,7 @@ function Pages.Settings(page)
         set(w.res, string.format("Session %s | connections %d | threads %d | owned instances %d | log entries %d | settings: %s",
             SESSION.id, c, t, i, #Log.entries, Config.source))
         set(w.results, SelfTest.summaryText())
+        set(w.verify, Verify.text())
     end
 end
 
@@ -4642,6 +5575,294 @@ function UI.build(parent)
     if Config.get("collapsed") then UI.setCollapsed(true) end
 end
 
+-- ==== MODULE: Verify =====================================================================
+-- Confirms every game-specific assumption against the live game, with evidence, and writes a
+-- world-structure report (file + clipboard) that can be shared to confirm details offline.
+-- Statuses: CONFIRMED | DIFFERENT (works, but not as assumed) | CONTRADICTED | NOT FOUND |
+--           PENDING (needs an in-game event first, e.g. a full inventory) | LEARNED (found by observation)
+Verify = {results = {}, ranAt = nil, running = false}
+
+local function vadd(R, claim, status, evidence)
+    R[#R + 1] = {claim = claim, status = status, evidence = tostring(evidence or "")}
+end
+
+local function promptSummary(prompt)
+    local action, object, key, hold, range = "?", "?", "?", "?", "?"
+    pcall(function()
+        action, object = prompt.ActionText, prompt.ObjectText
+        key = tostring(prompt.KeyboardKeyCode):gsub("^Enum%.KeyCode%.", "")
+        hold, range = prompt.HoldDuration, prompt.MaxActivationDistance
+    end)
+    return string.format("\"%s\" / \"%s\" key %s hold %ss range %s at %s", tostring(action), tostring(object),
+        tostring(key), tostring(hold), tostring(range), U.fullName(prompt.Parent))
+end
+
+function Verify.run()
+    if Verify.running then return Verify.results end
+    Verify.running = true
+    Ores.maintain(true)
+    local R = {}
+
+    -- 1. Mining root location
+    if Ores.root then
+        local full = U.fullName(Ores.root)
+        vadd(R, "Deposits live under workspace.WORKSPACE_Interactables.Mining",
+            full == "Workspace.WORKSPACE_Interactables.Mining" and "CONFIRMED" or "DIFFERENT",
+            full .. " (found by " .. tostring(Ores.rootHow) .. ")")
+    else
+        vadd(R, "Deposits live under workspace.WORKSPACE_Interactables.Mining", "NOT FOUND", Ores.status)
+    end
+
+    -- 2-4. Deposit layout, OreRemaining, ore type source
+    local total, withInfo, withValue, withMesh, inOreDeposits = 0, 0, 0, 0, 0
+    local sources, samples, sampleValue = {}, {}, nil
+    for _, e in pairs(Ores.deposits) do
+        total = total + 1
+        if e.node:FindFirstChild("DepositInfo") then withInfo = withInfo + 1 end
+        if e.remainingObj or e.remainingAttrHost then
+            withValue = withValue + 1
+            if not sampleValue then
+                sampleValue = (e.remainingObj and (e.remainingObj.ClassName .. " " .. U.fullName(e.remainingObj)) or
+                    ("attribute on " .. U.fullName(e.remainingAttrHost))) .. " = " .. tostring(e.remaining)
+            end
+        end
+        if e.mesh then withMesh = withMesh + 1 end
+        if U.has(U.fullName(e.node), ".OreDeposits.") then inOreDeposits = inOreDeposits + 1 end
+        sources[e.kindSource or "?"] = (sources[e.kindSource or "?"] or 0) + 1
+        if #samples < 3 then samples[#samples + 1] = U.fullName(e.node) end
+    end
+    local typeFolders = total - inOreDeposits
+    local function share(n)
+        if total == 0 then return "NOT FOUND" end
+        if n == total then return "CONFIRMED" end
+        if n > 0 then return "PARTLY" end
+        return "CONTRADICTED"
+    end
+    vadd(R, "Layout Mining/<OreType>/<Deposit> (v2.0 assumption)", share(typeFolders),
+        string.format("%d of %d deposits; samples: %s", typeFolders, total, total > 0 and table.concat(samples, " | ") or "-"))
+    vadd(R, "Layout Mining/OreDeposits/<group>/<Deposit> (public scripts)", inOreDeposits > 0 and "CONFIRMED" or
+        (total > 0 and "NOT PRESENT" or "NOT FOUND"), inOreDeposits .. " of " .. total .. " deposits")
+    vadd(R, "Deposits expose DepositInfo.OreRemaining", share(withValue),
+        string.format("%d/%d have DepositInfo, %d/%d a readable OreRemaining%s; %d/%d have an ore mesh%s",
+            withInfo, total, withValue, total, sampleValue and (" (e.g. " .. sampleValue .. ")") or "", withMesh, total,
+            (withValue < total and withMesh > 0) and " -> exhaustion tracked through the ore mesh" or ""))
+    local parts = {}
+    for source, n in pairs(sources) do parts[#parts + 1] = source .. " " .. n end
+    table.sort(parts)
+    vadd(R, "Ore type can be read for each deposit", (sources["no evidence yet"] or 0) == 0 and share(total) or "PARTLY",
+        #parts > 0 and table.concat(parts, ", ") or "no deposits")
+
+    -- 5-6. Pickaxe and interaction
+    local tool, where = Tools.find()
+    local visual = Tools.equippedVisual()
+    local slot = Learned.get("hotbarSlot")
+    local uiSlot = Tools.hotbarSlotFromUI()
+    if tool then
+        vadd(R, "Pickaxe is a Roblox Tool (v2.0 assumption)", "CONFIRMED", tool.Name .. " in " .. tostring(where))
+    else
+        vadd(R, "Pickaxe is a Roblox Tool (v2.0 assumption)", (visual or slot) and "CONTRADICTED" or "NOT FOUND",
+            (visual and ("game item in hand: " .. U.fullName(visual)) or "no pickaxe in hand") ..
+            (slot and ("; learned hotbar slot " .. slot) or "") .. (uiSlot and ("; hotbar UI shows it in slot " .. uiSlot) or "") ..
+            (Input.available() and "" or "; VirtualInputManager unavailable"))
+    end
+    local interact = Learned.get("interact")
+    vadd(R, "Mining interaction that produces progress", interact and "LEARNED" or "PENDING",
+        interact and (interact .. " (remembered for this place)") or "not observed yet - mine one deposit")
+
+    -- 7. Full inventory -> ground drop
+    vadd(R, "Full inventory drops mined ore on the ground (wiki)",
+        Inventory.dropsObserved > 0 and "CONFIRMED" or "PENDING",
+        Inventory.dropsObserved > 0 and (Inventory.dropsObserved .. " drop(s) observed this session")
+            or "only observable when the inventory is actually full")
+
+    -- 8. Sell prompts
+    local sellLines, sellLoot = {}, false
+    for prompt, c in pairs(Sellers.prompts) do
+        if c.score >= 100 and #sellLines < 6 then
+            sellLines[#sellLines + 1] = promptSummary(prompt)
+            local ok, action = pcall(function() return string.lower(prompt.ActionText or "") end)
+            if ok and U.has(action, "sell loot") then sellLoot = true end
+        end
+    end
+    local sellStatus = sellLoot and "CONFIRMED" or (#sellLines > 0 and "PARTLY" or "NOT FOUND")
+    vadd(R, "Ore is sold by holding the \"Sell Loot\" prompt at stores (wiki/forum)", sellStatus,
+        (#sellLines > 0 and table.concat(sellLines, " || ") or "no sell prompt replicated (stand near a General Store)") ..
+        string.format(" | verified sales this session: %d", Stats.sales))
+
+    -- 9-10. Inventory capacity and money
+    local s = Inventory.state
+    if Learn.inv then
+        vadd(R, "Inventory capacity is readable", "LEARNED", tostring(Learn.inv.path) .. (s.known and
+            (" = " .. U.num(s.used) .. "/" .. U.num(s.capacity)) or ""))
+    elseif s.known then
+        vadd(R, "Inventory capacity is readable", "CONFIRMED", s.source .. " = " .. U.num(s.used) .. "/" .. U.num(s.capacity))
+    else
+        vadd(R, "Inventory capacity is readable", "PENDING",
+            "no counter identified yet; it is learned from the first mined ore (wiki: backpack holds 40 slots)")
+    end
+    Wallet.discover(true)
+    vadd(R, "Money is readable", Learn.money and "LEARNED" or (Wallet.source and "CONFIRMED" or "PENDING"),
+        Wallet.source and (Wallet.label .. " = " .. tostring(Wallet.read())) or "not identified yet; learned from the first sale")
+
+    -- 11. Movement
+    vadd(R, "Character moves with Humanoid:MoveTo", Nav.driverVerified and (Nav.driver == "MoveTo" and "CONFIRMED" or
+        "CONTRADICTED") or "PENDING", Nav.driverVerified and ("working driver: " .. Nav.driver) or "not observed yet - travel once")
+
+    Verify.results = R
+    Verify.ranAt = U.now()
+    Verify.running = false
+    local counts = {}
+    for _, r in ipairs(R) do counts[r.status] = (counts[r.status] or 0) + 1 end
+    local summary = {}
+    for status, n in pairs(counts) do summary[#summary + 1] = status .. " " .. n end
+    table.sort(summary)
+    Log.info("Verify", "Assumption check: " .. table.concat(summary, ", "))
+    for _, r in ipairs(R) do Log.info("Verify", "[" .. r.status .. "] " .. r.claim .. ": " .. r.evidence) end
+    return R
+end
+
+function Verify.text()
+    if not Verify.ranAt then return "Not run yet. Press VERIFY ASSUMPTIONS while in a TWW server." end
+    local lines = {}
+    for _, r in ipairs(Verify.results) do
+        lines[#lines + 1] = "[" .. r.status .. "] " .. r.claim .. "\n    " .. r.evidence
+    end
+    return table.concat(lines, "\n")
+end
+
+local MAX_REPORT_LINES = 1600
+
+local function attrText(inst)
+    local ok, attrs = pcall(function() return inst:GetAttributes() end)
+    if not ok then return "" end
+    local parts = {}
+    for k, v in pairs(attrs) do
+        if #parts >= 6 then break end
+        parts[#parts + 1] = k .. "=" .. tostring(v)
+    end
+    if #parts == 0 then return "" end
+    table.sort(parts)
+    return "  {" .. table.concat(parts, ", ") .. "}"
+end
+
+local function dumpTree(inst, depth, maxDepth, lines, maxChildren, skip)
+    if #lines >= MAX_REPORT_LINES then return end
+    local info = inst.ClassName
+    pcall(function()
+        if inst:IsA("ValueBase") then info = info .. " = " .. tostring(inst.Value) end
+        if inst:IsA("TextLabel") or inst:IsA("TextButton") then info = info .. " \"" .. tostring(inst.Text) .. "\"" end
+    end)
+    lines[#lines + 1] = string.rep("  ", depth) .. inst.Name .. "  [" .. info .. "]" .. attrText(inst)
+    local children = inst:GetChildren()
+    if depth >= maxDepth then
+        if #children > 0 then lines[#lines + 1] = string.rep("  ", depth + 1) .. "... " .. #children .. " child(ren)" end
+        return
+    end
+    for i, c in ipairs(children) do
+        if i > maxChildren then
+            lines[#lines + 1] = string.rep("  ", depth + 1) .. "... +" .. (#children - maxChildren) .. " more"
+            break
+        end
+        if not (skip and skip[c]) then dumpTree(c, depth + 1, maxDepth, lines, maxChildren, skip) end
+    end
+end
+
+function Verify.worldReport()
+    if not Verify.ranAt then Verify.run() end
+    local lines = {}
+    local placeId, jobId = "?", "?"
+    pcall(function() placeId, jobId = tostring(game.PlaceId), tostring(game.JobId) end)
+    lines[#lines + 1] = APP_NAME .. " v" .. VERSION .. " world report"
+    lines[#lines + 1] = "PlaceId " .. placeId .. "  JobId " .. jobId .. "  executor " .. Exec.name
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Verification =="
+    lines[#lines + 1] = Verify.text()
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Mining root =="
+    if Ores.root then dumpTree(Ores.root, 0, 3, lines, 8) else lines[#lines + 1] = "not found" end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Sample deposits (full subtree) =="
+    local n = 0
+    for node in pairs(Ores.deposits) do
+        n = n + 1
+        if n > 3 then break end
+        lines[#lines + 1] = U.fullName(node)
+        dumpTree(node, 1, 4, lines, 30)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Workspace top level =="
+    for _, c in ipairs(Workspace:GetChildren()) do
+        lines[#lines + 1] = c.Name .. "  [" .. c.ClassName .. "]  " .. #c:GetChildren() .. " child(ren)"
+        if string.sub(c.Name, 1, 10) == "WORKSPACE_" then dumpTree(c, 1, 2, lines, 25) end
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Sell-like prompts =="
+    for prompt, c in pairs(Sellers.prompts) do
+        lines[#lines + 1] = string.format("score %d  %s", c.score, promptSummary(prompt))
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Player (without PlayerGui) =="
+    if LocalPlayer then
+        local skip = {}
+        if PlayerGui then skip[PlayerGui] = true end
+        dumpTree(LocalPlayer, 0, 3, lines, 40, skip)
+        lines[#lines + 1] = "attributes:" .. attrText(LocalPlayer)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Character models =="
+    for _, model in ipairs(Tools.characterModels()) do
+        lines[#lines + 1] = U.fullName(model)
+        dumpTree(model, 1, 2, lines, 60)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== PlayerGui: screens, N/M labels, money labels =="
+    if PlayerGui then
+        for _, gui in ipairs(PlayerGui:GetChildren()) do
+            if gui ~= UI.root then lines[#lines + 1] = "screen " .. gui.Name .. "  [" .. gui.ClassName .. "]" end
+        end
+        local fractions, money = 0, 0
+        for _, inst in ipairs(PlayerGui:GetDescendants()) do
+            if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and not U.isDescendantOf(inst, UI.root) then
+                local text = inst.Text or ""
+                if U.parseFraction(text) and fractions < 25 then
+                    fractions = fractions + 1
+                    lines[#lines + 1] = "N/M  " .. U.fullName(inst) .. " = \"" .. text .. "\""
+                elseif U.parseMoney(text) and money < 10 then
+                    money = money + 1
+                    lines[#lines + 1] = "$    " .. U.fullName(inst) .. " = \"" .. text .. "\""
+                end
+            end
+        end
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "== Learned for this place =="
+    for k, v in pairs(Learned.place()) do
+        lines[#lines + 1] = k .. " = " .. (type(v) == "table" and (#v .. " entr(ies)") or tostring(v))
+    end
+    if #lines >= MAX_REPORT_LINES then lines[#lines + 1] = "(report truncated)" end
+    return table.concat(lines, "\n")
+end
+
+function Verify.saveReport()
+    local text = Verify.worldReport()
+    local saved, copied = false, false
+    if Exec.writefile then
+        saved = pcall(function()
+            if Exec.makefolder and Exec.isfolder and not Exec.isfolder(SETTINGS_DIR) then Exec.makefolder(SETTINGS_DIR) end
+            Exec.writefile(SETTINGS_DIR .. "/world_report.txt", text)
+        end)
+    end
+    if Exec.setclipboard then copied = pcall(Exec.setclipboard, text) end
+    local count = select(2, string.gsub(text, "\n", "\n")) + 1
+    Log.info("Verify", string.format("World report: %d lines%s%s", count,
+        saved and (", saved to " .. SETTINGS_DIR .. "/world_report.txt") or "", copied and ", copied to clipboard" or ""))
+    if not saved and not copied then
+        Log.warn("Verify", "Neither writefile nor setclipboard is available; the report is only in the Logs tab")
+        for line in string.gmatch(text, "[^\n]+") do Log.info("Report", line) end
+    end
+    return text, saved, copied
+end
+
 -- ==== MODULE: SelfTest ===================================================================
 -- Non-destructive in-game checks. Nothing here moves the character or interacts with the game.
 SelfTest = {results = {}, ranAt = nil, running = false}
@@ -4673,7 +5894,14 @@ function SelfTest.run(includePath)
         #Ores.kindList, Ores.depositCount, withValue, without))
 
     local tool, where = Tools.find()
-    add("Pickaxe", tool and "PASS" or "WARN", tool and (tool.Name .. " (" .. where .. ")") or "no tool matches the pickaxe patterns")
+    local visual = Tools.equippedVisual()
+    local slot = Learned.get("hotbarSlot")
+    local pickDetail = (tool and (tool.Name .. " (Roblox Tool, " .. where .. ")"))
+        or (visual and ("game item in hand: " .. visual.Name))
+        or (slot and ("game item, learned hotbar slot " .. slot))
+        or ("not a Roblox Tool and not in hand; hotbar keys are tried when mining starts" ..
+            (Input.available() and "" or " (VirtualInputManager unavailable: equip it by hand)"))
+    add("Pickaxe", (tool or visual or slot) and "PASS" or "WARN", pickDetail)
 
     if not PathfindingService then
         add("Navigation planning", "FAIL", "PathfindingService unavailable")
@@ -4786,7 +6014,8 @@ handle.modules = {
     U = U, Log = Log, Session = Session, Token = Token, Config = Config, Stats = Stats, Char = Char, Tools = Tools,
     Blacklist = Blacklist, Ores = Ores, Nav = Nav, Visual = Visual, Probe = Probe, Miner = Miner,
     Inventory = Inventory, Wallet = Wallet, Sellers = Sellers, Targeting = Targeting, Auto = Auto, UI = UI,
-    SelfTest = SelfTest, SESSION = SESSION, Exec = Exec,
+    SelfTest = SelfTest, SESSION = SESSION, Exec = Exec, Learn = Learn, Learned = Learned, Verify = Verify,
+    Input = Input,
 }
 
 local function waitFor(getter, seconds)
@@ -4849,6 +6078,8 @@ end
 
 local function main()
     Config.load()
+    Nav.driver = Learned.get("moveDriver") == "Move" and "Move" or "MoveTo"
+    Nav.driverVerified = Learned.get("moveDriver") ~= nil
     Log.info("Main", APP_NAME .. " v" .. VERSION .. " starting (executor: " .. Exec.name .. ", settings: " .. Config.source .. ")")
     if not Players or not Workspace then
         warn("[Prospector] Players/Workspace services unavailable; aborting")
@@ -4882,6 +6113,7 @@ local function main()
     initStep("Character tracking", Char.init)
     initStep("Ore registry", function() Ores.maintain(true) end)
     initStep("Inventory monitor", Inventory.init)
+    initStep("Learned counters", Learn.restore)
     initStep("Money tracker", function() Wallet.discover(true) end)
     initStep("Seller discovery", Sellers.init)
 

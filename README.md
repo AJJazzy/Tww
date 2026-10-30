@@ -1,4 +1,4 @@
-# TWW Prospector Ultimate (v3.0.0)
+# TWW Prospector Ultimate (v3.1.0)
 
 Autonomous mining assistant for the Roblox game **The Wild West (TWW)**, delivered as one self-contained
 Luau file for client executors (target: Xeno 1.2.1).
@@ -7,11 +7,53 @@ Luau file for client executors (target: Xeno 1.2.1).
 |---|---|
 | `TWW_Prospector_Ultimate.lua` | The whole program. Execute this file. |
 | `tests/mock_roblox.lua` | Offline Roblox mock (instances, signals, virtual-time scheduler, pathfinding, humanoid movement). |
-| `tests/run_tests.lua` | 24 offline tests that load the **real** script file into the mock and drive it. |
+| `tests/run_tests.lua` | 31 offline tests that load the **real** script file into the mock and drive it. |
 
 > **Status:** the script has **not** been run inside Roblox or TWW. It was verified offline (syntax, global
-> usage, 24 behavioural tests against a mock). Everything game-specific in the
-> [verified/unverified table](#5-verified-vs-unverified-game-specific-features) needs a live test.
+> usage, 31 behavioural tests against a mock). Section [0](#0-what-was-checked-and-what-v31-changed) lists
+> what public sources confirm about the game. The script's **VERIFY ASSUMPTIONS** button checks each point
+> in your live server and reports the evidence.
+
+---
+
+## 0. What was checked and what v3.1 changed
+
+I can't run TWW from here, so "confirming" meant two things:
+
+1. Finding independent public evidence: two published TWW scripts, and the community wiki's text recovered
+   from search excerpts and a verbatim copy on Pastebin.
+2. Making the script check every assumption itself at runtime, and adapt when an assumption is wrong.
+
+| Assumption | What the evidence says | Verdict | What the script does now |
+|---|---|---|---|
+| Deposits are under `workspace.WORKSPACE_Interactables.Mining` | Two independent public scripts read `WORKSPACE_Interactables.Mining` ([LightMildTH/RobloxScripts](https://github.com/LightMildTH/RobloxScripts/blob/master/TheWildWest.lua), [yasinert12](https://github.com/yasinert12/yasinert12)) | **Confirmed** (path) | Uses it first; falls back to a folder named like "Mining", then the common ancestor of ore-named parts |
+| Deposits are `Mining/<OreType>/<Model>` with `DepositInfo.OreRemaining` | Both public scripts use **`Mining.OreDeposits.<group Folder>.<Model>`**, where each node holds a **MeshPart named `CoalOre`/`IronOre`/…**. Neither mentions `DepositInfo` or `OreRemaining`. The wiki says nodes are mined a fixed number of times (coal 3, zinc 2, gold 1), which fits a counter but doesn't prove one exists. | **Partly contradicted / unconfirmed** | Supports **both** layouts. The ore type comes from deposit evidence first (type attribute → ore-mesh name → deposit name → folder). Without `OreRemaining`, exhaustion is tracked by the ore mesh disappearing and respawning. |
+| A full inventory drops mined ore on the ground | Wiki, Ores and Gems (copy of v3.7.5): *"If your inventory is full, the ore will drop to the ground instead. Ore nodes have a chance to drop Gems in the place of their ores."* | **Confirmed** (wiki text) | Drop detection now also matches gems and accepts any parent folder. Second method: if ore is mined but the learned inventory counter doesn't rise twice, the inventory counts as full. |
+| Ore is sold by holding a prompt at General/Gun Store NPCs | Wiki, General Store: *"Players may 'Sell Loot' by holding the [F] key or access the 'General Store' by pressing the [E] key at every location."* A forum post agrees; the same thread says the Howling Peak merchant and the Hunter Shack did not buy. | **Confirmed** (wiki text) | Prefers "sell" prompts. If the prompt API doesn't trigger, it holds the prompt's own key (F). Sellers that paid or didn't pay are remembered per place; Howling Peak and Hunter Shack rank lower. |
+| Inventory capacity is readable from UI/data | Wiki, Backpack (v4.4.0): up to **40 slots**; stackable items count as one slot. Nothing public says where the client stores it. | **Unknown location** | **Learns by observation.** A `N/M` on-screen counter that was stable and then rose right after verified mining is promoted after two observations, then saved per place. |
+| Money is readable | Nothing public | **Unknown** | **Learns by observation.** A `$` or numeric display that rises right after a sale is promoted and saved; `$` labels and leaderstats are also checked. |
+| Pickaxe is a Roblox `Tool` swung by `Tool:Activate()` (v2.0) | The public script uses the game's own item framework (`…Character.Items`, `PlayerCharacter:EquipItem`); the wiki describes a hotbar | **Probably false** | Finds a Roblox Tool **or** the game item in hand (on the character or its `WORKSPACE_Entities.Players` copy). Equips via the hotbar key: Settings slot, learned slot, hotbar UI, or trying 1–9. **Auto** interaction switches between `Tool:Activate()` and a simulated click on the deposit and remembers what works. |
+| The character walks with `Humanoid:MoveTo` | The game has its own character controller (`PlayerCharacter` module) | **Unverified** | If the character doesn't move on two waypoints, switches to a per-frame `Humanoid:Move` driver and remembers it |
+
+Also from the wiki: minimum pickaxe tier per ore (Coal/Copper 1, Zinc 2, Iron/Limestone 3, Silver 4, Gold 5).
+If one ore type shows **no reaction at all** on three deposits in a row, that type is skipped for 10 minutes,
+with this hint in the log.
+
+Sources: [TWW wiki: Ores and Gems](https://thewild-west.fandom.com/wiki/Ores_and_Gems) (verbatim copy:
+[pastebin ASZbAM8Q](https://pastebin.com/ASZbAM8Q)) · [TWW wiki: General Store](https://thewild-west.fandom.com/wiki/General_Store) ·
+[TWW wiki: Backpack](https://thewild-west.fandom.com/wiki/Backpack) · [TWW wiki forum: Ore](https://thewild-west.fandom.com/f/p/4400000000000071105) ·
+[LightMildTH/RobloxScripts TheWildWest.lua](https://github.com/LightMildTH/RobloxScripts/blob/master/TheWildWest.lua) ·
+[yasinert12 script](https://github.com/yasinert12/yasinert12). The wiki pages themselves were behind a
+Cloudflare check, and web.archive.org is blocked from this environment, so wiki statements come from search
+excerpts and the Pastebin copy. The public scripts are older than the current 4.x game, so the layout may have
+changed again. That is why the script checks the layout at runtime.
+
+**In game:** open **Settings → Game assumptions**.
+- **VERIFY ASSUMPTIONS** prints CONFIRMED / DIFFERENT / CONTRADICTED / NOT FOUND / PENDING / LEARNED for
+  every row above, with the evidence it found.
+- **SAVE WORLD REPORT** writes `TWWProspector/world_report.txt` and copies it to the clipboard. It contains
+  the Mining tree, sample deposits, the sell prompts, the player, character and PlayerGui counters, and what
+  was learned. Send that file back and every remaining unknown can be settled.
 
 ---
 
@@ -21,7 +63,9 @@ Luau file for client executors (target: Xeno 1.2.1).
 2. The window appears on the left of the screen. `RightControl` shows or hides it (configurable).
 3. **Ore Management**: choose ore types and set priorities.
 4. Press **START** (Dashboard or sidebar). You never record routes or place waypoints.
-5. If something is not detected, open **Settings → Diagnostics → RUN SELF-TESTS** and read the **Logs** tab.
+5. If something is not detected, open **Settings → Game assumptions → VERIFY ASSUMPTIONS** and
+   **Settings → Diagnostics → RUN SELF-TESTS**, and read the **Logs** tab.
+6. If the pickaxe isn't found automatically, set **Settings → Pickaxe hotbar slot**.
 
 Re-executing the file at any time first shuts down the running copy completely, including v2.0.
 
@@ -35,14 +79,15 @@ plain function calls. There is one automation thread, guarded by a generation co
 ```
 Bootstrap/Util ─ Session (resource registry) ─ Token (cancellation) ─ Log ─ Config ─ Stats
         │
-        ├─ Char (character/respawn)  Tools (pickaxe)  Blacklist (back-off)
-        ├─ Ores (event-driven deposit registry + remembered sites)
-        ├─ Nav (PathfindingService, progressive legs, stuck recovery)  Visual (pooled route dots, Highlight)
-        ├─ Probe + Miner (approach, aim, interact, verify progress)
-        ├─ Inventory + Wallet (discovered sources, full detection, sale confirmation)
+        ├─ Learned (per-place knowledge, persisted)
+        ├─ Char (character/respawn)  Input (simulated keys/clicks)  Tools (Tool or game item, hotbar)
+        ├─ Blacklist (back-off)  Ores (two layouts, ore-mesh exhaustion, remembered sites, type pausing)
+        ├─ Nav (PathfindingService, progressive legs, stuck recovery, driver fallback)  Visual
+        ├─ Probe + Miner (approach, aim, Auto interaction, verify progress)
+        ├─ Learn (observation-based counters) + Inventory + Wallet (sources, full detection, sale checks)
         ├─ Sellers (prompt/store discovery, travel, prompt interaction, verification)
         ├─ Targeting (scoring + path validation)  Auto (finite-state machine)
-        └─ UI (7 tabs)  SelfTest  Main (teardown → GUI → subsystems → loops)
+        └─ UI (7 tabs)  Verify (assumption check + world report)  SelfTest  Main
 ```
 
 ### Key mechanisms
@@ -192,6 +237,26 @@ automatically).
 
 ---
 
+### v3.1 additions
+
+- **Ores:** both deposit layouts; ore type from deposit-level evidence; exhaustion and respawn through the ore
+  mesh when `OreRemaining` doesn't exist; root discovery from ore-named parts; ore types that never react are
+  paused (with the wiki tier hint); five non-reacting deposits in a row pause automation with a reason.
+- **Pickaxe:** Roblox Tool **or** game item. The game item is found on the character or its
+  `WORKSPACE_Entities` copy and equipped with its hotbar key (configured, learned, read from the hotbar UI, or
+  tried 1–9). The Auto interaction picks Tool or Click, switches after 6 swings without reaction, and remembers
+  what worked.
+- **Learn:** the inventory counter and money display are identified by observing which on-screen numbers or
+  player values change right after verified mining or a sale, then saved per PlaceId.
+- **Full inventory:** wider ground-drop detection (gems, any folder), plus "mined but counter unchanged twice".
+- **Selling:** falls back to holding the prompt's own key; remembers paying and non-paying sellers per place;
+  ranks Howling Peak and Hunter Shack lower.
+- **Movement:** falls back from `MoveTo` to a per-frame `Humanoid:Move` driver, and remembers the one that works.
+- **Verify:** the assumption check and world report described in section 0.
+- **New settings:** Pickaxe hotbar slot, interaction method `Auto` (new default), and Clear Learned Data.
+
+---
+
 ## 4. Testing
 
 ### Offline (performed)
@@ -199,10 +264,10 @@ automatically).
 ```
 sudo apt-get install luajit lua5.1     # LuaJIT allows yields across pcall, like Luau
 luac5.1 -p TWW_Prospector_Ultimate.lua # syntax check (the file uses the Lua 5.1 subset of Luau)
-luajit tests/run_tests.lua             # 24 tests; TEST_FILTER=<name part>, TEST_VERBOSE=1 dumps logs on failure
+luajit tests/run_tests.lua             # 31 tests; TEST_FILTER=<name part>, TEST_VERBOSE=1 dumps logs on failure
 ```
 
-The last run passed all 24 tests, and three consecutive full runs were identical. A bytecode listing confirmed
+The last run passed all 31 tests, and three consecutive full runs were identical. A bytecode listing confirmed
 that the script writes **no** globals and reads only Roblox/Luau builtins and feature-detected executor
 functions.
 
@@ -232,6 +297,16 @@ The tests cover:
 - the diagnostics path test not moving the character
 - progressive legs to a deposit 700 studs away
 - exploring a remembered streamed-out site
+- **v3.1:** the public-script layout (OreDeposits groups, ore MeshParts, no `OreRemaining`): types read from
+  mesh names, exhaustion by mesh removal, respawn noticed
+- **v3.1:** a game-item pickaxe: hotbar slot found by trying keys, mining by simulated clicks, both remembered
+- **v3.1:** inventory counter and money display learned from observation, with no telling names, while an
+  unrelated number on screen keeps changing
+- **v3.1:** a sell prompt that ignores the prompt API, triggered by holding its key (F); the paying seller is
+  remembered
+- **v3.1:** an ore type that never reacts is paused with the tier hint, and other types continue
+- **v3.1:** the movement driver switching when `MoveTo` does nothing
+- **v3.1:** VERIFY ASSUMPTIONS verdicts for both layouts, and the world report
 
 **What the mock cannot prove**: how TWW's real pickaxe, inventory, money and sell prompt behave. In each test
 the mock *scripts* those behaviours to match the assumptions in section 5.
@@ -239,7 +314,8 @@ the mock *scripts* those behaviours to match the assumptions in section 5.
 ### In-game (requires you)
 
 1. Execute the script. Check the Logs tab for `GUI`, `Ore registry: ready` and `Seller discovery: ready`.
-2. Go to **Settings → Diagnostics → RUN SELF-TESTS**. Expect PASS for GUI, LocalPlayer, Character, Ore
+2. Go to **Settings → Game assumptions → VERIFY ASSUMPTIONS**, then **SAVE WORLD REPORT** (send me the file
+   if anything shows NOT FOUND, DIFFERENT or CONTRADICTED). Then **Settings → Diagnostics → RUN SELF-TESTS**. Expect PASS for GUI, LocalPlayer, Character, Ore
    hierarchy, Ore discovery, Cancellation and Navigation planning. WARN for inventory, money or sellers means
    that source was not identified yet.
 3. **Mining:** stand near one deposit, select only its type, then START. The Logs should show
@@ -259,23 +335,22 @@ the mock *scripts* those behaviours to match the assumptions in section 5.
 
 ## 5. Verified vs unverified game-specific features
 
-Public TWW documentation is sparse. The community wiki pages were not readable from this environment (HTTP
-402), and only search-result excerpts were available.
+See [section 0](#0-what-was-checked-and-what-v31-changed) for the evidence. In short:
 
-| Feature | Source | Status |
+| Feature | Public evidence | Runtime handling |
 |---|---|---|
-| `workspace.WORKSPACE_Interactables.Mining/<Type>/<Deposit>` | your v2.0 script | **Unverified by me.** Configurable paths plus heuristic fallback. |
-| `DepositInfo.OreRemaining` (IntValue/NumberValue) | your v2.0 script | **Unverified.** Also accepts attributes, nested values, or none (other progress signals). |
-| Mining fills a progress bar; ore goes to the player who lands the final hit; a full inventory drops ore on the ground | community wiki excerpts (thewild-west.fandom.com) | **Unverified in-game.** Used for progress and full-inventory heuristics. |
-| Pickaxe is a `Tool` whose name contains "pick" | v2.0 assumption | **Unverified.** Name patterns are configurable. |
-| The TWW pickaxe swings on `Tool:Activate()` | v2.0 assumption | **Unverified, highest risk.** Alternative: VirtualInputManager click at the deposit. |
-| Ore is sold by holding a sell prompt at General Store / Gun Store NPCs | community forum post | **Unverified.** Prompts with "sell" text are preferred; store NPCs and buildings are weaker candidates. |
-| Inventory capacity representation | unknown | **Not found.** Discovered heuristically; reported as unknown otherwise. |
-| Money location (leaderstats / attribute / `$` label) | unknown | **Not found.** Optional; sales can also be confirmed by inventory changes. |
-| Ore items as Backpack Tools | unknown | **Unverified.** Only one of several yield signals. |
-| Roblox APIs used (PathfindingService, Humanoid:MoveTo, GetPivot/GetBoundingBox, Raycast, ProximityPrompt InputHoldBegin/End, Tool:Activate, RequestStreamAroundAsync) | Roblox documentation | Documented engine APIs. Behaviour in TWW not tested live. |
+| `WORKSPACE_Interactables.Mining` root | Confirmed by two public scripts | Verified in game by VERIFY ASSUMPTIONS; fallbacks if moved |
+| Deposit layout / `DepositInfo.OreRemaining` | Public scripts show `OreDeposits` + ore MeshParts, no `OreRemaining` | Both layouts supported; mesh-based exhaustion |
+| Full inventory → ore on the ground | Confirmed by wiki text | Drop detection plus a counter-correlation check |
+| "Sell Loot" prompt held with F at stores | Confirmed by wiki text and a forum post | Prompt API, then the prompt's key; per-place seller memory |
+| Inventory capacity | 40 backpack slots (wiki v4.4.0); location unknown | Learned by observation, or a heuristic UI source, or reported unknown |
+| Money | Unknown | Learned by observation, or `$` labels/leaderstats |
+| Pickaxe type and swing input | Game item framework, so probably not a Roblox Tool | Tool or game item; hotbar key; Auto Tool/Click |
+| Movement via `Humanoid:MoveTo` | Custom controller, unverified | Automatic fallback to `Humanoid:Move` |
 
-No RemoteEvents are called, guessed or hooked. No anti-cheat, metatable, or namecall hooks are used.
+No RemoteEvents are called, guessed or hooked. No game modules are `require`d. No anti-cheat, metatable, or
+namecall hooks are used. All input is either a documented engine API or a simulated key/mouse event of the
+kind a player produces.
 
 ---
 
@@ -296,5 +371,10 @@ No RemoteEvents are called, guessed or hooked. No anti-cheat, metatable, or name
 - A "Click" interaction depends on VirtualInputManager being accessible from your executor. Sell-dialog
   clicking is off by default because the dialog layout is unknown.
 - Roblox's idle disconnect (about 20 minutes without real input) is not circumvented.
+- Learning needs events: the inventory counter is learned only after ore has been mined twice, and money only
+  after a sale. Until then those sources show as PENDING or unknown.
+- Trying hotbar keys 1–9 briefly equips whatever is in those slots. Set the pickaxe slot in Settings to avoid it.
+- The game-item pickaxe and mouse clicks need VirtualInputManager. Without it, the script asks you to equip the
+  pickaxe by hand and stays paused until you do.
 - Using executors breaks Roblox's Terms of Use and may break TWW's rules. Server-side checks may still flag
   automated play even though only normal interactions are used.

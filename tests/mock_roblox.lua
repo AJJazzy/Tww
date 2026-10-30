@@ -307,7 +307,8 @@ InstMT.__tostring = function(obj) return registry[obj].props.Name end
 local DEFAULTS = {
     Humanoid = {Health = 100, MaxHealth = 100, WalkSpeed = 16, Jump = false, Sit = false, PlatformStand = false},
     Part = {Size = Vector3.new(2, 1, 4), Anchored = false, Transparency = 0},
-    ProximityPrompt = {ActionText = "Interact", ObjectText = "", HoldDuration = 0, MaxActivationDistance = 10, Enabled = true},
+    ProximityPrompt = {ActionText = "Interact", ObjectText = "", HoldDuration = 0, MaxActivationDistance = 10, Enabled = true,
+        KeyboardKeyCode = Enum.KeyCode.E},
     ScreenGui = {Enabled = true},
     BillboardGui = {Enabled = true},
     Tool = {ToolTip = ""},
@@ -436,7 +437,7 @@ function Methods.GetPivot(obj)
 end
 -- Humanoid
 function Methods.MoveTo(obj, pos) registry[obj].props._moveTarget = pos end
-function Methods.Move(obj) end
+function Methods.Move(obj, dir) registry[obj].props._moveDir = dir end
 function Methods.EquipTool(obj, tool)
     local char = registry[obj].Parent
     Methods.UnequipTools(obj)
@@ -456,13 +457,22 @@ end
 function Methods.Activate(obj) obj.Activated:Fire() end
 function Methods.Deactivate(obj) obj.Deactivated:Fire() end
 -- ProximityPrompt
-function Methods.InputHoldBegin(obj) registry[obj].props._holdStart = S.now end
+function Methods.InputHoldBegin(obj)
+    if M.promptIgnoresInputHold then return end
+    registry[obj].props._holdStart = S.now
+end
 function Methods.InputHoldEnd(obj)
     local d = registry[obj]
     local start = d.props._holdStart
     d.props._holdStart = nil
-    if not start or not d.props.Enabled then return end
-    if S.now - start + 1e-6 < d.props.HoldDuration then return end
+    if not start then return end
+    M.tryTriggerPrompt(obj, S.now - start)
+end
+-- Shared by InputHoldEnd and by a held keyboard key (see M.holdKeyForPrompts).
+function M.tryTriggerPrompt(obj, held)
+    local d = registry[obj]
+    if not d.props.Enabled then return end
+    if held + 1e-6 < d.props.HoldDuration then return end
     local root = M.root()
     local anchor = d.Parent and (d.Parent.Position or (d.Parent.PrimaryPart and d.Parent.PrimaryPart.Position))
     if not root or not anchor or (root.Position - anchor).Magnitude > d.props.MaxActivationDistance then return end
@@ -477,8 +487,15 @@ function Methods.Fire(obj, ...) obj.Event:Fire(...) end
 function Methods.GetPlayers() return {M.player} end
 function Methods.GetFocusedTextBox() return nil end
 function Methods.GetGuiInset() return Vector2.new(0, 36) end
-function Methods.SendMouseButtonEvent(obj, x, y) M.clicks = (M.clicks or 0) + 1 end
-function Methods.SendKeyEvent() end
+function Methods.SendMouseButtonEvent(obj, x, y, button, isDown)
+    M.clicks = (M.clicks or 0) + 1
+    if isDown and M.onClick then M.onClick(x, y) end
+end
+function Methods.SendMouseMoveEvent() end
+function Methods.SendKeyEvent(obj, isDown, keyCode)
+    M.keyEvents = (M.keyEvents or 0) + 1
+    if M.onKey then M.onKey(keyCode, isDown) end
+end
 function Methods.JSONEncode() return "{}" end
 function Methods.JSONDecode() return {} end
 function Methods.Create(obj, inst, info, props)
@@ -543,9 +560,12 @@ function M.reset()
     M.walkBlocked = nil
     M.genv = {}
     M.inventory, M.money, M.mining, M.swings, M.missed = nil, nil, nil, nil, nil
+    M.onKey, M.onClick, M.promptIgnoresInputHold, M.keyEvents = nil, nil, nil, 0
     M.character, M.humanoid = nil, nil
 
     local game = new("DataModel")
+    game.PlaceId = 2317712696
+    game.JobId = "mock-job"
     local workspace = new("Workspace", game)
     workspace.Name = "Workspace"
     local camera = new("Camera", workspace)
@@ -657,9 +677,16 @@ end
 local function simulateMovement(dt)
     local hum, root = M.humanoid, M.root()
     if not hum or not root or hum.Health <= 0 then return end
-    local target = registry[hum].props._moveTarget
-    if not target or hum._frozen then return end
+    if hum._frozen then return end
     local pos = root.Position
+    local moveDir = registry[hum].props._moveDir
+    local target = registry[hum].props._moveTarget
+    if moveDir and moveDir.Magnitude > 0.01 then
+        target = pos + Vector3.new(moveDir.X, 0, moveDir.Z).Unit * 1000
+    elseif hum._ignoreMoveTo then
+        return
+    end
+    if not target then return end
     local delta = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
     local dist = delta.Magnitude
     if dist < 0.05 then
